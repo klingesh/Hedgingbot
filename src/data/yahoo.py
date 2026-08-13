@@ -202,17 +202,28 @@ def align_price_frame(
     Columns that fail to fetch are omitted and reported rather than aborting: a
     single missing hedge candidate should not kill the whole beta study.
     """
-    fetched: dict[str, dict[str, float]] = {}
+    # Several column names can map to ONE Yahoo symbol — GC=F is both the METALS
+    # factor proxy and the GOLD instrument, CL=F is both ENERGY and WTI. Fetch each
+    # distinct symbol once. Yahoo rate-limits by IP, so every avoided request is
+    # worth having.
+    by_symbol: dict[str, list[str]] = {}
     for name, ysym in symbols.items():
+        by_symbol.setdefault(ysym, []).append(name)
+
+    fetched: dict[str, dict[str, float]] = {}
+    for ysym, names in by_symbol.items():
+        label = names[0] if len(names) == 1 else f"{names[0]} (+{len(names) - 1})"
         try:
             bars = fetch_daily(ysym, years=years, use_cache=use_cache,
                                max_age_hours=max_age_hours)
-            fetched[name] = bars.as_map()
+            price_map = bars.as_map()
+            for name in names:
+                fetched[name] = price_map
             if verbose:
-                print(f"  {name:<10} {ysym:<12} {len(bars):>5} rows  "
+                print(f"  {label:<16} {ysym:<12} {len(bars):>5} rows  "
                       f"{bars.dates[0]} -> {bars.dates[-1]}")
         except Exception as exc:
-            print(f"  {name:<10} {ysym:<12} FAILED: {exc!r}")
+            print(f"  {label:<16} {ysym:<12} FAILED: {exc!r}")
 
     if not fetched:
         raise RuntimeError("no symbols fetched successfully")

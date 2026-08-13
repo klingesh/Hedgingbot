@@ -261,8 +261,29 @@ def main() -> int:
     for name, (ysym, _b, _f) in HEDGE_CANDIDATES.items():
         wanted.setdefault(name, ysym)
 
-    dates, frame = align_price_frame(wanted, years=args.years,
-                                     use_cache=not args.no_cache)
+    try:
+        dates, frame = align_price_frame(wanted, years=args.years,
+                                         use_cache=not args.no_cache)
+    except RuntimeError as exc:
+        # Almost always a network problem, and a stack trace tells the user
+        # nothing useful about it.
+        print(f"\nFATAL: {exc}")
+        print("\nEvery price fetch failed. Usual causes, in order of likelihood:")
+        print("  1. No internet access, or a proxy/firewall blocking "
+              "query1.finance.yahoo.com")
+        print("  2. Yahoo rate-limiting this IP — wait a few minutes and retry")
+        print("  3. Yahoo changed its chart API (the loader would need updating)")
+        print("\nNothing was written, so any existing beta file is untouched.")
+        print("\nTo confirm the maths itself is fine without any network:")
+        print("    python -m pytest tests/ -q")
+        print("The estimator is verified against synthetic data with known betas,")
+        print("so a failure here is a DATA problem, not a model problem.")
+        return 1
+
+    if len(dates) < 2:
+        print(f"\nFATAL: only {len(dates)} date(s) fetched. Nothing to estimate.")
+        return 1
+
     print(f"\n  Common date axis: {len(dates)} days "
           f"({dates[0]} -> {dates[-1]})")
 
@@ -292,7 +313,17 @@ def main() -> int:
     describe_concentration(inst_rets, list(TRADINGBOT_PORTFOLIO))
 
     # ---- factors ---------------------------------------------------------
-    factors, kept = build_factors(proxy_rets, ORTHOGONALIZATION_ORDER, halflife)
+    try:
+        factors, kept = build_factors(proxy_rets, ORTHOGONALIZATION_ORDER, halflife)
+    except ValueError as exc:
+        print(f"\nFATAL: could not build the factor model: {exc}")
+        print("\nThis means the factor proxies had too little OVERLAPPING history.")
+        print("The factors must share one common sample, so a single proxy with a")
+        print("short series truncates all of them. Try:")
+        print("  * --years 15   (fetch more history)")
+        print("  * --no-cache   (a stale/truncated cache file can cause this)")
+        print("  * check which proxy is short in the fetch listing above")
+        return 1
     _hr("2. FACTOR CONSTRUCTION")
     print(f"   observations={factors.n_obs}  order={' -> '.join(factors.names)}")
     print(f"   halflife={halflife}  winsorize={args.winsorize}")
@@ -322,7 +353,16 @@ def main() -> int:
     print("   counting an unorthogonalized model would have hidden.")
 
     # ---- betas -----------------------------------------------------------
-    book, skipped = estimate_betas(inst_rets, factors, kept, halflife, args.min_obs)
+    try:
+        book, skipped = estimate_betas(inst_rets, factors, kept, halflife, args.min_obs)
+    except ValueError as exc:
+        print(f"\nFATAL: could not estimate betas: {exc}")
+        print(f"\nEvery instrument had fewer than --min-obs ({args.min_obs}) "
+              "observations overlapping the factor sample.")
+        print("Try --years 15, or lower --min-obs — but be aware that betas from a")
+        print("few dozen observations are noise, and the overlay would size real")
+        print("hedges from them.")
+        return 1
     _hr("3. MEASURED BETAS")
     print(book.summary(priors=priors_for(book.instruments())))
     if skipped:
