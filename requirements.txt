@@ -1,0 +1,23 @@
+# Hedgingbot has NO third-party runtime dependencies.
+#
+# The factor maths, exposure model, decision layer, state and data loader are
+# all pure standard library. That is deliberate: this is risk-management code
+# that has to be verifiable in any environment and runnable on a bare VPS with
+# no scientific stack. It also means the numbers that size a hedge can be read
+# line by line rather than taken on trust from a vectorized one-liner.
+#
+# Only two optional extras exist:
+
+# Tests.
+pytest>=8.0
+
+# Config file parsing. Optional — the loader falls back to a tiny built-in
+# parser for the flat subset of YAML this project's config uses, so the overlay
+# still runs if PyYAML is absent.
+PyYAML>=6.0
+
+# Broker layer — Windows only, install manually alongside the MT5 terminal:
+#   pip install MetaTrader5>=5.0.45
+# Kept out of this file so the pure layers stay importable on any OS
+# (same convention as Tradingbot).
+# MetaTrader5>=5.0.45

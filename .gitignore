@@ -1,0 +1,31 @@
+# --- Secrets / local config (NEVER commit) ---
+config/hedge_config.yaml
+config/publish.yaml
+.env
+mt5_login.json
+credentials.json
+
+# --- Generated artefacts ---
+logs/
+data_cache/
+betas/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+venv/
+.venv/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
