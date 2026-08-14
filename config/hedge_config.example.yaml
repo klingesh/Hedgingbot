@@ -1,0 +1,114 @@
+# ---------------------------------------------------------------------------
+# Hedgingbot — exposure overlay configuration
+#
+# Copy to config/hedge_config.yaml (gitignored) and edit.
+#   cp config/hedge_config.example.yaml config/hedge_config.yaml
+# ---------------------------------------------------------------------------
+
+# "observe" = measure and log ONLY, place no orders. START HERE and stay here
+#             for at least a few weeks. It costs nothing and tells you whether
+#             the concentration is real before any money is at risk.
+# "live"    = actually place hedge orders.
+mode: observe
+
+# Belt-and-braces. Even in mode: live, nothing is sent while dry_run is true.
+dry_run: true
+
+connection:
+  # Blank => attach to whatever account the MT5 terminal is already logged into
+  # (same convention as Tradingbot). Fill these ONLY if you need an explicit
+  # login, and remember this file is gitignored for that reason.
+  login:
+  password:
+  server:
+  path:
+
+# ---------------------------------------------------------------------------
+# Risk caps, in LEVERAGE units.
+#
+#   cap: 1.5  =>  "a 1% adverse move in this factor may cost at most 1.5% of
+#                  equity"
+#
+# HOW TO CHOOSE THESE: do not guess. Run in observe mode, look at the measured
+# leverage your book actually runs, and set the cap somewhere below the level
+# that produced drawdowns you disliked. A cap above your observed maximum does
+# nothing at all; a cap far below it will hedge constantly and bleed spread.
+#
+# The values below are placeholders chosen to be roughly at the edge of a
+# 2%-risk-per-trade, 8-slot book. Replace them with your own measurements.
+# ---------------------------------------------------------------------------
+caps:
+  USD: 1.50      # the dominant shared factor of the Tradingbot portfolio
+  RISK: 1.50
+  ENERGY: 1.00
+  METALS: 1.25
+
+# --- anti-churn band. Read overlay/decision.py before touching these. ------
+bands:
+  hysteresis: 0.25       # act only above cap * 1.25
+  target_fraction: 0.80  # hedge down to cap * 0.80, not to the cap itself
+  unwind_band: 0.60      # close the hedge below cap * 0.60
+                         # must be <= target_fraction or the overlay churns
+
+limits:
+  # Total hedge notional ceiling, as a % of EQUITY. Deliberately large: leveraged
+  # CFD notional is inherently many times equity. One lot of EURUSD is ~108,000
+  # of notional, so on a 10,000 account a 200% ceiling (=20,000) would cap the
+  # overlay at 0.18 lots and it would spend its life refusing to hedge.
+  # CALIBRATE THIS from the gross_notional that observe mode reports for your book.
+  max_hedge_gross_pct: 1000.0
+  min_purity: 0.50             # a hedge leg must be at least this single-factor
+  min_abs_beta: 0.20           # ...and at least this sensitive to the factor
+  max_actions_per_cycle: 1     # one change per cycle, then let it settle
+  max_hedges_per_day: 6        # hard brake on churn; overlay stops acting after this
+  allow_unmapped: false        # false => refuse to hedge if any open symbol
+                               # has no betas. Keep it false.
+
+# ---------------------------------------------------------------------------
+# Beta estimation
+# ---------------------------------------------------------------------------
+betas:
+  # Where estimate_betas.py writes, and where the live overlay reads.
+  path: betas/betas_latest.json
+  # Refuse to trade on betas older than this. Correlations regime-shift; a
+  # six-month-old beta is a guess wearing a lab coat.
+  max_age_days: 30
+  history_years: 8
+  halflife_days: 252     # recent data weighted more heavily. null => equal weight
+  winsorize: 0.005       # clip 0.5% from each return tail (NATGAS spikes)
+  min_obs: 250
+
+# ---------------------------------------------------------------------------
+# Hedge instruments. Broker symbols must match YOUR broker exactly — discover
+# them with Tradingbot's scripts/check_mt5.py or scripts/check_account_mode.py.
+# ---------------------------------------------------------------------------
+hedge_instruments:
+  EURUSD: EURUSD.ecn
+  US500: US500.ecn
+  USOIL: USOIL.ecn
+  XAGUSD: XAGUSD.ecn
+
+# The trader's own symbols. The overlay will NOT trade these, because on a
+# NETTING account an opposing order on the same symbol reduces the trader's
+# position instead of hedging it.
+trader_symbols:
+  GOLD: XAUUSD.ecn
+  SILVER: XAGUSD.ecn
+  PLATINUM: XPTUSD.ecn
+  NATGAS: NGAS.ecn
+  BRENT: UKOIL.ecn
+  GBPJPY: GBPJPY.ecn
+  AUDUSD: AUDUSD.ecn
+  USDJPY: USDJPY.ecn
+
+run:
+  # MUST differ from Tradingbot's 990011, so each bot can identify its own
+  # positions via magic while still seeing the other's.
+  magic_number: 990012
+  poll_seconds: 60
+  # MUST differ from Tradingbot's logs/bot.lock or the two bots cannot coexist.
+  lock_path: logs/hedge.lock
+  state_path: logs/portfolio_state.json
+  status_path: logs/hedge_status.json
+  # Read-only peek at the trader's heartbeat, for logging context only.
+  trader_status_path: logs/status.json
