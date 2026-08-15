@@ -19,7 +19,11 @@ import math
 import pytest
 
 import scripts.estimate_betas as eb
-from src.factors.definitions import FACTOR_PROXIES, ORTHOGONALIZATION_ORDER
+from src.factors.definitions import (
+    FACTOR_BASKETS,
+    FACTOR_PROXIES,
+    ORTHOGONALIZATION_ORDER,
+)
 from tests.test_math_core import LCG
 
 
@@ -30,13 +34,27 @@ def prices_from_returns(rets: list[float], start: float = 100.0) -> list[float]:
     return px
 
 
+def basket_components() -> list[str]:
+    """Every distinct yahoo symbol used by any factor basket."""
+    seen: list[str] = []
+    for components, _desc in FACTOR_BASKETS.values():
+        for sym in components:
+            if sym not in seen:
+                seen.append(sym)
+    return seen
+
+
 def make_frame(n: int, seed: int = 1, instruments=("GOLD", "EURUSD")):
-    """A full fetch result: factor proxy columns plus instrument columns."""
+    """A full fetch result: basket component columns plus instrument columns.
+
+    Components are keyed `__cmp_<symbol>` because factors are now built from
+    baskets of symbols rather than one series per factor.
+    """
     rng = LCG(seed)
     dates = [f"2020-{1 + (i // 28) % 12:02d}-{1 + i % 28:02d}" for i in range(n + 1)]
     frame: dict[str, list] = {}
-    for f in FACTOR_PROXIES:
-        frame[f"__factor_{f}"] = prices_from_returns(rng.normals(n, 0.0, 0.01))
+    for sym in basket_components():
+        frame[f"__cmp_{sym}"] = prices_from_returns(rng.normals(n, 0.0, 0.01))
     for inst in instruments:
         frame[inst] = prices_from_returns(rng.normals(n, 0.0, 0.012))
     return dates, frame
@@ -77,20 +95,44 @@ def test_single_date_exits_cleanly(monkeypatch, capsys):
     assert "Nothing to estimate" in capsys.readouterr().out
 
 
-def test_missing_factor_proxy_exits_cleanly(monkeypatch, capsys):
+def test_missing_factor_components_exit_cleanly(monkeypatch, capsys):
+    """If EVERY component of a factor fails to fetch, that factor cannot exist."""
     dates, frame = make_frame(400)
-    del frame["__factor_METALS"]          # simulate one proxy failing to fetch
+    for sym in FACTOR_BASKETS["METALS"][0]:
+        frame.pop(f"__cmp_{sym}", None)
 
     assert run_with_frame(monkeypatch, dates, frame, ["--min-obs", "100"]) == 1
 
     out = capsys.readouterr().out
     assert "FATAL" in out
     assert "METALS" in out
-    assert "FACTOR_PROXIES" in out
+    assert "FACTOR_BASKETS" in out
+
+
+def test_partial_basket_still_builds_with_a_warning(monkeypatch, capsys):
+    """Losing SOME components of a basket is survivable — the factor is built from
+    what remains and the omission is reported, rather than aborting the study."""
+    dates, frame = make_frame(900, seed=17)
+    components = FACTOR_BASKETS["METALS"][0]
+    assert len(components) >= 2, "this test needs a real basket"
+    frame.pop(f"__cmp_{components[-1]}", None)
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "200", "--skip-stability"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING: component(s)" in out
+    assert components[-1] in out
 
 
 def test_too_little_factor_history_exits_cleanly(monkeypatch, capsys):
-    """Fewer than 30 aligned factor observations is a hard stop."""
+    """Fewer than 30 aligned observations is a hard stop.
+
+    With baskets this now fails at basket construction rather than at
+    orthogonalization, which is earlier and more specific about WHICH factor and
+    why. Both paths must stay actionable.
+    """
     dates, frame = make_frame(20)
 
     assert run_with_frame(monkeypatch, dates, frame, ["--min-obs", "5"]) == 1
@@ -98,6 +140,7 @@ def test_too_little_factor_history_exits_cleanly(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "could not build the factor model" in out
     assert "--years" in out
+    assert "untouched" in out, "must reassure that no beta file was overwritten"
 
 
 def test_instruments_all_too_short_exits_cleanly(monkeypatch, capsys):
@@ -309,3 +352,180 @@ def test_align_price_frame_unions_mismatched_date_axes(monkeypatch):
     assert dates == ["2020-01-01", "2020-01-02", "2020-01-03"]
     assert frame["A"] == [1.0, 2.0, None]
     assert frame["B"] == [None, 3.0, 4.0]
+
+
+
+# ---------------------------------------------------------------------------
+# Alignment gate
+# ---------------------------------------------------------------------------
+
+
+def _misaligned_frame(n: int = 900):
+    """A frame where the instrument's labels are one day later than the factors."""
+    from datetime import date, timedelta
+
+    rng = LCG(808)
+
+    def bdays(start: str, count: int) -> list[str]:
+        d = date.fromisoformat(start)
+        out: list[str] = []
+        while len(out) < count:
+            if d.weekday() < 5:
+                out.append(d.isoformat())
+            d += timedelta(days=1)
+        return out
+
+    factor_days = bdays("2019-01-01", n)
+    shifted_days = [
+        (date.fromisoformat(d) + timedelta(days=1)).isoformat() for d in factor_days
+    ]
+    combined = sorted(set(factor_days) | set(shifted_days))
+    idx = {d: i for i, d in enumerate(combined)}
+
+    frame: dict[str, list] = {}
+    for sym in basket_components():
+        col = [None] * len(combined)
+        px = prices_from_returns(rng.normals(n - 1, 0.0, 0.01))
+        for i, d in enumerate(factor_days):
+            col[idx[d]] = px[i]
+        frame[f"__cmp_{sym}"] = col
+
+    inst = [None] * len(combined)
+    px = prices_from_returns(rng.normals(n - 1, 0.0, 0.012))
+    for i, d in enumerate(shifted_days):
+        inst[idx[d]] = px[i]
+    frame["GOLD"] = inst
+
+    return combined, frame
+
+
+def test_misaligned_data_stops_the_study(monkeypatch, capsys, tmp_path):
+    """Refuse to write betas from data whose dates do not line up."""
+    import os
+
+    dates, frame = _misaligned_frame()
+    out = os.path.join(str(tmp_path), "betas.json")
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "100", "--out", out])
+
+    assert rc == 1
+    text = capsys.readouterr().out
+    assert "MISALIGNED" in text
+    assert "STOPPING" in text
+    assert "--align-to-reference" in text
+    assert not os.path.exists(out), "no beta file may be written from bad data"
+
+
+def test_ignore_misalignment_proceeds_but_is_labelled_dangerous(monkeypatch, capsys,
+                                                                tmp_path):
+    import os
+
+    dates, frame = _misaligned_frame()
+    out = os.path.join(str(tmp_path), "betas.json")
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "100", "--ignore-misalignment", "--out", out])
+
+    assert rc == 0
+    assert "MISALIGNED" in capsys.readouterr().out
+    assert os.path.exists(out)
+
+
+def test_align_to_reference_is_not_blocked_by_the_gate(monkeypatch, capsys, tmp_path):
+    """--align-to-reference IS the fix, so the gate demanding a fix must not
+    block it. This was a real ordering bug: the early return fired first and the
+    flag could never take effect."""
+    import os
+
+    dates, frame = _misaligned_frame()
+    out = os.path.join(str(tmp_path), "betas.json")
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "100", "--align-to-reference", "--out", out])
+
+    assert rc == 0, "aligning must be allowed to proceed"
+    text = capsys.readouterr().out
+    assert "Applied label offsets" in text
+    assert "prices unchanged" in text
+    assert os.path.exists(out)
+
+
+def test_align_to_reference_restores_overlap(monkeypatch, capsys, tmp_path):
+    """After aligning, the instrument must be estimated on far more observations."""
+    import os
+
+    from src.factors.store import load_betas
+
+    dates, frame = _misaligned_frame()
+
+    out_bad = os.path.join(str(tmp_path), "bad.json")
+    run_with_frame(monkeypatch, dates, {k: list(v) for k, v in frame.items()},
+                   ["--min-obs", "50", "--ignore-misalignment", "--out", out_bad])
+    bad, _ = load_betas(out_bad, max_age_days=1)
+
+    out_fixed = os.path.join(str(tmp_path), "fixed.json")
+    run_with_frame(monkeypatch, dates, {k: list(v) for k, v in frame.items()},
+                   ["--min-obs", "50", "--align-to-reference", "--out", out_fixed])
+    fixed, _ = load_betas(out_fixed, max_age_days=1)
+
+    # Aligning must reach the FULL factor sample, not merely more of it.
+    assert fixed.n_obs("GOLD") > bad.n_obs("GOLD"), (
+        f"aligning should recover observations: "
+        f"{bad.n_obs('GOLD')} -> {fixed.n_obs('GOLD')}"
+    )
+
+    # Note how MILD the observation loss is: a one-weekday shift still lands
+    # Mon->Tue, Tue->Wed, Wed->Thu, Thu->Fri on valid weekdays, so only the
+    # Friday->Saturday roll is dropped. Roughly 75% of observations survive.
+    #
+    # That is precisely what makes this bug dangerous. It does not announce
+    # itself as missing data -- the row counts look fine. The damage is that the
+    # surviving observations are MISPAIRED: one day's instrument return regressed
+    # against the next day's factor. R^2 collapses while everything else looks
+    # healthy. See test_alignment_diagnostics.test_reproduces_the_live_fx_symptom
+    # for the R^2 > 0.99 -> < 0.15 demonstration.
+    assert bad.n_obs("GOLD") > 0.5 * fixed.n_obs("GOLD"), (
+        "documents that a shift loses only a minority of observations, which is "
+        "why row counts alone cannot detect it"
+    )
+
+
+def test_circularity_is_reported_quantitatively(monkeypatch, capsys, tmp_path):
+    """GOLD is a member of the METALS basket, so some self-reference remains. It
+    must be reported as a measured self-weight, not merely as a yes/no warning —
+    the magnitude is what tells you whether the R2 is usable."""
+    import os
+
+    dates, frame = make_frame(900, seed=44, instruments=("GOLD", "EURUSD"))
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "200", "--skip-stability",
+                         "--out", os.path.join(str(tmp_path), "b.json")])
+
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "CIRCULARITY" in text
+    assert "self-weight" in text
+    assert "GOLD" in text and "METALS" in text
+    # GOLD is one of three basket members, so it must NOT read as the whole factor.
+    assert "A TRADED instrument IS a factor" not in text
+
+
+def test_basket_weights_are_persisted(monkeypatch, tmp_path):
+    """The weights are part of the model definition: without them you cannot tell
+    later what 'METALS' actually meant when these betas were fitted."""
+    import os
+
+    from src.factors.store import load_betas
+
+    dates, frame = make_frame(900, seed=45)
+    out = os.path.join(str(tmp_path), "b.json")
+    assert run_with_frame(monkeypatch, dates, frame,
+                          ["--min-obs", "200", "--skip-stability",
+                           "--out", out]) == 0
+
+    _book, meta = load_betas(out, max_age_days=1)
+    assert meta["factor_baskets"]["METALS"] == list(FACTOR_BASKETS["METALS"][0])
+    weights = meta["basket_weights"]["METALS"]
+    assert set(weights) == set(FACTOR_BASKETS["METALS"][0])
+    assert sum(weights.values()) == pytest.approx(1.0)

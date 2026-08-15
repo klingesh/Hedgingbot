@@ -60,6 +60,8 @@ class AccountState:
     margin_mode: int
     trade_allowed: bool
     trade_expert: bool
+    server: str = ""
+    company: str = ""
 
     @property
     def margin_mode_name(self) -> str:
@@ -153,6 +155,8 @@ class MT5Reader:
             margin_mode=int(getattr(a, "margin_mode", -1)),
             trade_allowed=bool(a.trade_allowed),
             trade_expert=bool(a.trade_expert),
+            server=str(getattr(a, "server", "") or ""),
+            company=str(getattr(a, "company", "") or ""),
         )
 
     def margin_mode(self) -> str:
@@ -250,8 +254,18 @@ class MT5Reader:
         return [p for p in self.all_positions() if p.magic == magic]
 
     def specs_for(self, positions: list[Position]) -> dict[str, InstrumentSpec]:
-        """Specs keyed by broker symbol for every symbol in `positions`."""
-        return {p.symbol: self.spec(p.symbol) for p in {q.symbol: q for q in positions}}
+        """Specs keyed by broker symbol, one lookup per DISTINCT symbol.
+
+        Deduplicating matters: four separate 0.25-lot gold tickets are four
+        Position objects on one symbol, and symbol_info is a synchronous terminal
+        call.
+
+        (The previous one-liner iterated a dict, which yields KEYS — so it passed
+        strings where Position objects were expected and crashed with
+        "'str' object has no attribute 'symbol'". Iterating a set of symbols
+        directly makes that class of mistake impossible.)
+        """
+        return {symbol: self.spec(symbol) for symbol in sorted({p.symbol for p in positions})}
 
     def symbol_details(self, symbol: str) -> dict:
         """Extra facts useful for diagnostics and Phase 2 order placement."""

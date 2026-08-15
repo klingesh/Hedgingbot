@@ -178,6 +178,36 @@ class BetaBook:
                     out.append((inst, fac, m, p))
         return out
 
+    def scale_sigmas(self, factor: float) -> "BetaBook":
+        """Return a copy with every volatility multiplied by `factor`.
+
+        Used to convert volatilities estimated over a multi-day return period into
+        DAILY-equivalent numbers, by scaling with 1/sqrt(period_days).
+
+        This exists because BETAS and VOLATILITIES behave differently across
+        horizons. A beta is a ratio of covariance to variance, so it is roughly
+        horizon-invariant — which is exactly why estimating on weekly returns to
+        defeat an intraday timing offset is legitimate. A volatility is NOT
+        horizon-invariant: a weekly sigma is about sqrt(5) times a daily one.
+
+        The exposure model consumes sigmas as DAILY (factor_daily_risk,
+        portfolio_daily_risk). Handing it weekly sigmas silently inflates every
+        risk figure by ~2.24x, so the conversion happens once here, at the point
+        the betas are persisted, and the basis is recorded in the file's metadata.
+        """
+        if not (factor > 0) or not math.isfinite(factor):
+            raise ValueError(f"scale factor must be finite and > 0, got {factor!r}")
+        out = BetaBook(
+            factors=self.factors,
+            betas={k: dict(v) for k, v in self._betas.items()},
+            r_squared=dict(self._r2),
+            sigma={k: v * factor for k, v in self._sigma.items()},
+            resid_sigma={k: v * factor for k, v in self._resid.items()},
+            n_obs=dict(self._nobs),
+            factor_sigma={k: v * factor for k, v in self._factor_sigma.items()},
+        )
+        return out
+
     def to_dict(self) -> dict:
         return {
             "factors": list(self.factors),

@@ -56,14 +56,64 @@ ORTHOGONALIZATION_ORDER: tuple[str, ...] = (USD, RISK, ENERGY, METALS)
 
 #: factor -> (yahoo symbol, sign, human description)
 #:
-#: `sign` flips the proxy so that a POSITIVE factor return always means the
-#: economically positive direction of the factor name. DXY already rises when
-#: the dollar strengthens, so USD is +1.
+#: NOTE ON ROLE: since factors became baskets (see FACTOR_BASKETS below), this
+#: table is no longer what BUILDS the factors. It survives for two things:
+#:   1. `sign`, applied per SYMBOL, so a proxy quoted the wrong way round can be
+#:      inverted. Nothing currently ships with sign=-1 because DXY already rises
+#:      when the dollar strengthens, but swapping in EURUSD as the dollar proxy
+#:      would need -1 and forgetting it would invert every USD beta.
+#:   2. Human-readable descriptions.
+#: The authoritative factor definitions are in FACTOR_BASKETS.
 FACTOR_PROXIES: dict[str, tuple[str, int, str]] = {
     USD:    ("DX-Y.NYB", +1, "US Dollar Index (DXY) — dollar strength"),
     RISK:   ("^GSPC",    +1, "S&P 500 — risk-on sentiment"),
     ENERGY: ("CL=F",     +1, "WTI crude — energy complex"),
     METALS: ("GC=F",     +1, "Gold — metals / real-rates complex"),
+}
+
+# ---------------------------------------------------------------------------
+# FACTOR BASKETS
+#
+# A factor built from ONE series that is also a traded instrument is circular:
+# the instrument gets regressed on itself, reports R2 = 1.00 and idiosyncratic
+# vol = 0.00, and the risk model concludes it has no unhedgeable risk. That
+# happened live with GOLD, because METALS was proxied by GC=F and GOLD trades
+# GC=F.
+#
+# Baskets are applied SELECTIVELY, not everywhere, because circularity is only
+# harmful in one direction:
+#
+#   TRADED instrument == factor      -> BAD. Fake R2, fake zero idio, the risk
+#                                       model understates unhedgeable risk.
+#   HEDGE CANDIDATE == factor        -> GOOD. Beta is 1.0 by construction, so
+#                                       hedge sizing is exact. Leave it alone.
+#
+# Applying that rule to this book:
+#
+#   METALS  BASKET (gold + silver + platinum). GOLD, SILVER and PLATINUM are all
+#           traded, and gold alone was the proxy. This is the one that must change.
+#   ENERGY  single CL=F. BRENT is traded but uses BZ=F, a different series
+#           (measured R2 0.86 — high but real). WTI is only a hedge candidate, so
+#           its circularity makes it a perfectly pure ENERGY lever. Adding BZ=F to
+#           the basket would make BRENT *more* circular, not less.
+#   RISK    single ^GSPC. No traded slot is an equity index; SP500 (ES=F) is a
+#           hedge candidate only.
+#   USD     single DX-Y.NYB. No traded slot is the dollar index. EURUSD is a hedge
+#           candidate and is ~58% of DXY by weight, which is exactly why it
+#           measures purity 0.99 as a USD lever.
+#
+# Components are weighted at EQUAL RISK (inverse volatility), not equally, so a
+# high-vol member cannot dominate the factor. See factors/baskets.py.
+# ---------------------------------------------------------------------------
+
+#: factor -> (component yahoo symbols, description)
+#: A single-element tuple means "no basket, use this series directly".
+FACTOR_BASKETS: dict[str, tuple[tuple[str, ...], str]] = {
+    USD:    (("DX-Y.NYB",), "US Dollar Index (DXY)"),
+    RISK:   (("^GSPC",), "S&P 500"),
+    ENERGY: (("CL=F",), "WTI crude"),
+    METALS: (("GC=F", "SI=F", "PL=F"),
+             "Metals complex: gold + silver + platinum at equal risk"),
 }
 
 #: If DXY is unavailable (it is occasionally flaky on Yahoo), synthesize a
@@ -87,12 +137,17 @@ USD_SYNTHETIC_BASKET: dict[str, tuple[int, float]] = {
 # repos never disagree about what "GOLD" means.
 # ---------------------------------------------------------------------------
 
+#: Broker symbols here are the JustMarkets ECN names CONFIRMED against a live
+#: account (login 1100219238, JustMarkets-Demo2) with scripts/check_account_mode.py.
+#: Note NGAS/UKOIL/USOIL do NOT exist there — the real names are XNGUSD, BRENT and
+#: WTI. Always confirm against your own account; symbol naming is broker-specific
+#: and even varies between account types at the same broker.
 TRADINGBOT_PORTFOLIO: dict[str, tuple[str, str, str]] = {
     "GOLD":     ("GC=F",     "XAUUSD", "commodity"),
     "SILVER":   ("SI=F",     "XAGUSD", "commodity"),
     "PLATINUM": ("PL=F",     "XPTUSD", "commodity"),
-    "NATGAS":   ("NG=F",     "NGAS",   "commodity"),
-    "BRENT":    ("BZ=F",     "UKOIL",  "commodity"),
+    "NATGAS":   ("NG=F",     "XNGUSD", "commodity"),
+    "BRENT":    ("BZ=F",     "BRENT",  "commodity"),
     "GBPJPY":   ("GBPJPY=X", "GBPJPY", "forex"),
     "AUDUSD":   ("AUDUSD=X", "AUDUSD", "forex"),
     "USDJPY":   ("USDJPY=X", "USDJPY", "forex"),
@@ -112,18 +167,24 @@ TRADINGBOT_PORTFOLIO: dict[str, tuple[str, str, str]] = {
 # ---------------------------------------------------------------------------
 
 #: logical -> (yahoo symbol, broker symbol, preferred_for factor or None)
+#:
+#: IMPORTANT: the KEYS here are the logical names the BetaBook is indexed by, so
+#: `hedge_instruments` in your config must use these exact keys. Using broker-ish
+#: keys (US500 instead of SP500, USOIL instead of WTI) makes every candidate
+#: invisible to the beta lookup, and the overlay then reports "no usable hedge
+#: instrument" for a factor it could actually hedge perfectly well.
 HEDGE_CANDIDATES: dict[str, tuple[str, str, str | None]] = {
     # Cleanest single-factor USD expression available as a retail CFD.
     "EURUSD": ("EURUSD=X", "EURUSD", USD),
     # Backup / cross-check USD leg.
     "USDCHF": ("USDCHF=X", "USDCHF", USD),
-    # Equity index for RISK. US500 is the tightest-spread index CFD at most brokers.
+    # Equity index for RISK. Tightest-spread index CFD at most brokers.
     "SP500":  ("ES=F",     "US500",  RISK),
-    # WTI for ENERGY (BRENT is already a book position, so hedging with WTI
-    # avoids netting against the trader's own leg on the same symbol).
-    "WTI":    ("CL=F",     "USOIL",  ENERGY),
-    # Silver is the liquid metals leg that is NOT gold, so it can offset a
-    # METALS breach without colliding with the GOLD slot.
+    # WTI for ENERGY. BRENT is already a book position, so hedging with WTI keeps
+    # the hedge off a symbol the trader holds.
+    "WTI":    ("CL=F",     "WTI",    ENERGY),
+    # Silver is the liquid metals leg that is NOT gold, so it can offset a METALS
+    # breach without colliding with the GOLD slot.
     "SILVER": ("SI=F",     "XAGUSD", METALS),
 }
 

@@ -74,29 +74,53 @@ betas:
   # six-month-old beta is a guess wearing a lab coat.
   max_age_days: 30
   history_years: 8
+  # NOTE: halflife_days and min_obs are counted in PERIODS, not calendar days.
+  # On a weekly run, 250 "min_obs" would demand 5 years of data. estimate_betas.py
+  # scales its own defaults by the return period; these keys are only read by
+  # tooling that overrides them explicitly.
   halflife_days: 252     # recent data weighted more heavily. null => equal weight
   winsorize: 0.005       # clip 0.5% from each return tail (NATGAS spikes)
   min_obs: 250
+  # Recommended: run with --return-period weekly. Daily FX betas are attenuated
+  # ~45% because Yahoo FX spot and futures are snapshotted hours apart.
+  return_period: weekly
 
 # ---------------------------------------------------------------------------
-# Hedge instruments. Broker symbols must match YOUR broker exactly — discover
-# them with Tradingbot's scripts/check_mt5.py or scripts/check_account_mode.py.
+# Hedge instruments.
+#
+# THE KEY IS NOT COSMETIC. Keys must exactly match the logical names in
+# HEDGE_CANDIDATES / TRADINGBOT_PORTFOLIO in src/factors/definitions.py, because
+# that is how betas are looked up. Writing `US500:` instead of `SP500:` makes the
+# candidate invisible to the beta book, and the overlay then reports
+# "NO usable hedge instrument" for RISK even though US500 would hedge it fine.
+#
+#   key   = logical name (must match definitions.py)
+#   value = YOUR broker's symbol (confirm with check_account_mode.py)
+#
+# Values below are JustMarkets ECN names confirmed against a live demo account.
 # ---------------------------------------------------------------------------
+# Betas below are from a WEEKLY estimation run (--return-period weekly) on 8
+# years of history. Weekly rather than daily because Yahoo's FX spot series and
+# its futures series are snapshotted at different times of day, which attenuates
+# daily FX betas by roughly half. See the synchronicity check in
+# scripts/estimate_betas.py.
 hedge_instruments:
-  EURUSD: EURUSD.ecn
-  US500: US500.ecn
-  USOIL: USOIL.ecn
-  XAGUSD: XAGUSD.ecn
+  EURUSD: EURUSD.ecn      # USD lever    — beta -0.96, purity 1.00
+  SP500: US500.ecn        # RISK lever   — beta +0.92, purity 0.87
+  WTI: WTI.ecn            # ENERGY lever — beta +0.98, purity 0.97
+  SILVER: XAGUSD.ecn      # METALS lever — beta +1.44, purity 0.69
 
-# The trader's own symbols. The overlay will NOT trade these, because on a
-# NETTING account an opposing order on the same symbol reduces the trader's
-# position instead of hedging it.
+# The trader's own symbols. The overlay will NOT trade these. Same key rule
+# applies.
+#
+# NOTE: JustMarkets does NOT use NGAS / UKOIL / USOIL. The real names are
+# XNGUSD, BRENT and WTI. Confirm yours rather than copying these.
 trader_symbols:
   GOLD: XAUUSD.ecn
   SILVER: XAGUSD.ecn
   PLATINUM: XPTUSD.ecn
-  NATGAS: NGAS.ecn
-  BRENT: UKOIL.ecn
+  NATGAS: XNGUSD.ecn
+  BRENT: BRENT.ecn
   GBPJPY: GBPJPY.ecn
   AUDUSD: AUDUSD.ecn
   USDJPY: USDJPY.ecn

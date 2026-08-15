@@ -29,8 +29,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.yahoo import align_price_frame                            # noqa: E402
+from src.data.diagnostics import (                                       # noqa: E402
+    diagnose_alignment,
+    render_synchronicity,
+    synchronicity_profile,
+)
+from src.data.yahoo import align_price_frame, to_period                  # noqa: E402
+from src.factors.baskets import build_basket, circularity_report        # noqa: E402
 from src.factors.definitions import (                                    # noqa: E402
+    FACTOR_BASKETS,
     FACTOR_PROXIES,
     FACTORS,
     HEDGE_CANDIDATES,
@@ -55,6 +62,44 @@ def _hr(title: str) -> None:
     print("\n" + "=" * 78)
     print(title)
     print("=" * 78)
+
+
+def _apply_offsets(dates, frame, report) -> dict:
+    """Re-file each misaligned series onto the reference calendar, in place.
+
+    Only the date LABEL a price is filed under changes; no price is altered,
+    invented or interpolated. This corrects a source-metadata artefact — Yahoo
+    timestamps FX and futures bars on different session boundaries — rather than
+    massaging data to fit.
+
+    Returns {series_name: applied_offset}.
+    """
+    from datetime import date as _date
+    from datetime import timedelta as _timedelta
+
+    index = {d: i for i, d in enumerate(dates)}
+    applied: dict = {}
+
+    for s in report.misaligned():
+        column = frame.get(s.name)
+        if column is None:
+            continue
+        shifted = [None] * len(dates)
+        delta = _timedelta(days=s.best_offset)
+        for i, value in enumerate(column):
+            if value is None:
+                continue
+            try:
+                target = (_date.fromisoformat(dates[i]) + delta).isoformat()
+            except ValueError:
+                continue
+            j = index.get(target)
+            if j is not None:
+                shifted[j] = value
+        frame[s.name] = shifted
+        applied[s.name] = s.best_offset
+
+    return applied
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +262,30 @@ def hedge_purity_table(book, candidates: list[str]) -> None:
             row += f"{book.beta(c, f):>11.2f}/{book.purity(c, f):<7.2f}"
         print(row)
 
-    print("\n   Best available lever per factor (score = purity^2 * |beta|):")
+    # Apply the SAME thresholds the overlay enforces (HedgeCaps defaults).
+    # Without them this table happily reported "RISK -> EURUSD beta +0.01,
+    # purity 0.00" as the best lever — technically the highest score, but an
+    # instrument the overlay would reject outright. A report that disagrees with
+    # the thing it is reporting on is worse than no report.
+    from src.overlay.decision import HedgeCaps
+
+    defaults = HedgeCaps(factor_caps={"USD": 1.0})
+    min_p, min_b = defaults.min_purity, defaults.min_abs_beta
+
+    print(f"\n   Best available lever per factor (score = purity^2 * |beta|),")
+    print(f"   applying the overlay's own thresholds: purity >= {min_p}, "
+          f"|beta| >= {min_b}")
     for f in FACTORS:
-        best = book.best_hedge_for(f, candidates)
+        best = book.best_hedge_for(f, candidates, min_purity=min_p,
+                                   min_abs_beta=min_b)
         if best is None:
-            print(f"     {f:<8} -> NO USABLE CANDIDATE")
+            near = book.best_hedge_for(f, candidates)
+            extra = ""
+            if near:
+                extra = (f"  (closest was {near}: beta "
+                         f"{book.beta(near, f):+.2f}, purity "
+                         f"{book.purity(near, f):.2f} — rejected)")
+            print(f"     {f:<8} -> NO USABLE CANDIDATE{extra}")
             continue
         print(f"     {f:<8} -> {best:<10} beta {book.beta(best, f):+.2f}, "
               f"purity {book.purity(best, f):.2f}")
@@ -240,22 +304,65 @@ def hedge_purity_table(book, candidates: list[str]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Estimate factor betas for the overlay.")
     ap.add_argument("--years", type=float, default=8.0)
-    ap.add_argument("--halflife", type=float, default=252.0,
-                    help="exponential weighting half-life in days; 0 => equal weight")
+    ap.add_argument("--halflife", type=float, default=None,
+                    help="exponential weighting half-life, in PERIODS; 0 => equal "
+                         "weight. Default scales with --return-period (252 daily, "
+                         "~50 weekly)")
     ap.add_argument("--winsorize", type=float, default=0.005)
-    ap.add_argument("--min-obs", type=int, default=250)
+    ap.add_argument("--min-obs", type=int, default=None,
+                    help="minimum observations per instrument, in PERIODS. Default "
+                         "scales with --return-period (250 daily, 50 weekly)")
     ap.add_argument("--out", default=os.path.join("betas", "betas_latest.json"))
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--skip-stability", action="store_true")
+    ap.add_argument("--max-offset", type=int, default=2,
+                    help="how many days of date-label shift to test for misalignment")
+    ap.add_argument("--min-align-gain", type=float, default=0.10,
+                    help="relative overlap gain from a shift before calling a series "
+                         "misaligned")
+    ap.add_argument("--align-to-reference", action="store_true",
+                    help="re-file misaligned series onto the factor calendar. Changes "
+                         "only the date label a price is filed under, never a price.")
+    ap.add_argument("--ignore-misalignment", action="store_true",
+                    help="write betas even from misaligned data. Do not use this "
+                         "unless you know exactly why.")
+    ap.add_argument("--return-period", default="daily",
+                    choices=("daily", "weekly", "biweekly", "monthly"),
+                    help="return horizon for beta estimation. Use weekly when the "
+                         "synchronicity report says the series are priced at "
+                         "different moments within the day (default: daily)")
     args = ap.parse_args()
 
     halflife = args.halflife if args.halflife and args.halflife > 0 else None
 
+    # Trading days per return period, used for both annualization and the
+    # daily-equivalent sigma conversion.
+    period_days = {"daily": 1, "weekly": 5, "biweekly": 10, "monthly": 21}[
+        args.return_period
+    ]
+
+    # --min-obs and --halflife are expressed in PERIODS, so their daily defaults
+    # are wrong for a weekly run. 250 weekly observations is five years, and the
+    # stability check (which wants 4x min_obs) then becomes impossible: an 8-year
+    # sample is only ~417 weeks. Scale the defaults unless explicitly overridden.
+    if args.min_obs is None:
+        args.min_obs = max(30, int(round(250 / period_days)))
+        if period_days > 1:
+            print(f"  --min-obs defaulted to {args.min_obs} "
+                  f"({args.return_period} periods, scaled from 250 daily)")
+    if args.halflife is None:
+        halflife = max(20.0, 252.0 / period_days)
+    else:
+        halflife = args.halflife if args.halflife > 0 else None
+
     # ---- fetch -----------------------------------------------------------
     _hr("FETCHING DAILY HISTORY")
     wanted: dict[str, str] = {}
-    for f, (sym, _sign, _desc) in FACTOR_PROXIES.items():
-        wanted[f"__factor_{f}"] = sym
+    # Every basket component, keyed by its own symbol so components shared between
+    # baskets and instruments are fetched once.
+    for _f, (components, _desc) in FACTOR_BASKETS.items():
+        for sym in components:
+            wanted[f"__cmp_{sym}"] = sym
     for name, (ysym, _b, _c) in TRADINGBOT_PORTFOLIO.items():
         wanted[name] = ysym
     for name, (ysym, _b, _f) in HEDGE_CANDIDATES.items():
@@ -287,28 +394,143 @@ def main() -> int:
     print(f"\n  Common date axis: {len(dates)} days "
           f"({dates[0]} -> {dates[-1]})")
 
-    factor_prices: dict[str, list] = {}
-    for f, (_sym, sign, _desc) in FACTOR_PROXIES.items():
-        col = frame.get(f"__factor_{f}")
-        if col is None:
-            continue
-        # Apply the proxy sign so a POSITIVE factor return always means the
-        # economically positive direction of the factor's name.
-        factor_prices[f] = ([1.0 / p if (p and p > 0) else None for p in col]
-                            if sign < 0 else col)
+    # ---- data integrity, BEFORE any maths -------------------------------
+    # Betas from misaligned dates look plausible and are worthless, so this runs
+    # first and can stop the whole study.
+    # Anchor the calendar on the FIRST component of the first factor. Baskets are
+    # built on the intersection of their components, so any one of them defines
+    # the same calendar family.
+    ref_col = f"__cmp_{FACTOR_BASKETS[ORTHOGONALIZATION_ORDER[0]][0][0]}"
+    if ref_col in frame:
+        _hr("0. DATA ALIGNMENT CHECK")
+        align_report = diagnose_alignment(
+            dates, frame, reference=ref_col,
+            max_offset=args.max_offset,
+            min_gain=args.min_align_gain,
+        )
+        print(align_report.render())
 
-    missing = [f for f in ORTHOGONALIZATION_ORDER if f not in factor_prices]
-    if missing:
-        print(f"\nFATAL: factor proxy fetch failed for {missing}. Cannot build the "
-              "factor model. Re-run, or edit FACTOR_PROXIES in "
-              "src/factors/definitions.py.")
+        # --align-to-reference is the FIX, so it must not be blocked by the gate
+        # that exists to demand a fix.
+        if (align_report.misaligned() and not args.ignore_misalignment
+                and not args.align_to_reference):
+            print("\n" + "=" * 78)
+            print("STOPPING: refusing to write betas from misaligned data.")
+            print("=" * 78)
+            print("\nThe series above are filed under date labels that disagree with")
+            print("the factor calendar by a day. Regressing them pairs one day's")
+            print("return against another day's factor, which drives R^2 toward 0 and")
+            print("betas toward 0 — and the output looks perfectly reasonable, which")
+            print("is what makes it dangerous.")
+            print("\nOptions:")
+            print("  --align-to-reference   snap every series onto the factor calendar")
+            print("                         by applying its best offset (recommended;")
+            print("                         it corrects a labelling artefact, it does")
+            print("                         not alter any price)")
+            print("  --ignore-misalignment  proceed anyway and DO NOT trust the result")
+            print("\nNothing was written. Any existing beta file is untouched.")
+            return 1
+
+        if args.align_to_reference:
+            fixed = _apply_offsets(dates, frame, align_report)
+            if fixed:
+                print(f"\n  Applied label offsets: "
+                      + ", ".join(f"{n}{o:+d}" for n, o in fixed.items()))
+                print("  (prices unchanged — only the date each price is filed under)")
+
+    # Circularity is now measured quantitatively per factor in section 1b
+    # (self-weight), which is strictly more informative than the old binary
+    # same-series check, so that warning has moved there.
+
+    # Apply the proxy sign so a POSITIVE factor return always means the
+    # economically positive direction of the factor's name.
+    signs = {sym: sign for _f, (sym, sign, _d) in FACTOR_PROXIES.items()}
+    component_prices: dict[str, list] = {}
+    for key, col in frame.items():
+        if not key.startswith("__cmp_"):
+            continue
+        sym = key[len("__cmp_"):]
+        component_prices[sym] = (
+            [1.0 / p if (p and p > 0) else None for p in col]
+            if signs.get(sym, 1) < 0 else col
+        )
+
+    missing_factors = []
+    for f in ORTHOGONALIZATION_ORDER:
+        components, _desc = FACTOR_BASKETS[f]
+        if not any(sym in component_prices for sym in components):
+            missing_factors.append(f)
+    if missing_factors:
+        print(f"\nFATAL: every component failed to fetch for factor(s) "
+              f"{missing_factors}. Cannot build the factor model. Re-run, or edit "
+              "FACTOR_BASKETS in src/factors/definitions.py.")
         return 1
 
-    instrument_prices = {k: v for k, v in frame.items() if not k.startswith("__factor_")}
+    instrument_prices = {k: v for k, v in frame.items() if not k.startswith("__cmp_")}
 
-    # ---- returns ---------------------------------------------------------
-    proxy_rets = returns_from_prices(factor_prices, args.winsorize)
+    # ---- optional return-period resampling -------------------------------
+    if args.return_period != "daily":
+        merged = dict(component_prices)
+        merged.update(instrument_prices)
+        dates, merged = to_period(dates, merged, args.return_period)
+        component_prices = {k: merged[k] for k in component_prices}
+        instrument_prices = {k: merged[k] for k in instrument_prices}
+        print(f"\n  Resampled to {args.return_period}: {len(dates)} periods "
+              f"({dates[0]} -> {dates[-1]})")
+        print("  Longer periods make an intraday snapshot-time offset negligible,")
+        print("  at the cost of sample size. Use this when the daily betas are")
+        print("  BIASED (see the synchronicity report), not merely noisy.")
+
+    # ---- returns, then build the factor baskets --------------------------
+    component_rets = returns_from_prices(component_prices, args.winsorize)
     inst_rets = returns_from_prices(instrument_prices, args.winsorize)
+
+    _hr("1b. FACTOR BASKETS")
+    proxy_rets: dict[str, list] = {}
+    basket_weights: dict[str, dict[str, float]] = {}
+    for f in ORTHOGONALIZATION_ORDER:
+        components, desc = FACTOR_BASKETS[f]
+        available = {s: component_rets[s] for s in components if s in component_rets}
+        dropped = [s for s in components if s not in component_rets]
+        if len(available) == 1:
+            only = next(iter(available))
+            proxy_rets[f] = available[only]
+            basket_weights[f] = {only: 1.0}
+            print(f"   {f:<8} single series {only:<10} {desc}")
+        else:
+            try:
+                series, weights = build_basket(available, halflife=halflife)
+            except ValueError as exc:
+                print(f"\nFATAL: could not build the factor model — the {f} basket "
+                      f"failed: {exc}")
+                print("\nA basket needs a common sample where ALL its components")
+                print("have data, so one short or gappy component limits the whole")
+                print("factor. Try:")
+                print("  * --years 15    (fetch more history)")
+                print("  * --no-cache    (a truncated cache file can cause this)")
+                print(f"  * drop the offending component from FACTOR_BASKETS[{f!r}]")
+                print("    in src/factors/definitions.py")
+                print("\nNothing was written; any existing beta file is untouched.")
+                return 1
+            proxy_rets[f] = series
+            basket_weights[f] = weights
+            detail = "  ".join(f"{s}={w:.0%}" for s, w in sorted(weights.items()))
+            print(f"   {f:<8} basket of {len(available)}: {detail}")
+            print(f"            {desc}")
+        if dropped:
+            print(f"            WARNING: component(s) {dropped} failed to fetch "
+                  f"and were excluded from the basket")
+
+    print("\n   Weights are EQUAL RISK (inverse volatility), so a high-vol member")
+    print("   cannot dominate a factor and mislabel itself as the whole complex.")
+
+    # ---- circularity, now measurable rather than binary -------------------
+    print("\n   CIRCULARITY — how much of each factor is an instrument's own series:")
+    print()
+    all_symbols = {n: y for n, (y, _b, _c) in TRADINGBOT_PORTFOLIO.items()}
+    all_symbols.update({n: y for n, (y, _b, _f) in HEDGE_CANDIDATES.items()})
+    print(circularity_report(all_symbols, basket_weights,
+                             traded=list(TRADINGBOT_PORTFOLIO)))
 
     describe_concentration(inst_rets, list(TRADINGBOT_PORTFOLIO))
 
@@ -329,12 +551,21 @@ def main() -> int:
     print(f"   halflife={halflife}  winsorize={args.winsorize}")
     print(f"   orthogonality error (max |corr| off-diagonal) = "
           f"{factors.orthogonality_error():.2e}\n")
-    print(f"   {'factor':<8}{'daily vol':>11}{'ann vol':>10}{'var retained':>14}")
-    print("   " + "-" * 41)
+    # Annualize with the ACTUAL number of periods per year. Hardcoding 252 here
+    # printed ENERGY at 94.8% annual vol on weekly data — sqrt(252) applied to a
+    # weekly sigma, i.e. 2.2x too big.
+    per_year = 252.0 / float(period_days)
+    label = f"{args.return_period} vol"
+    print(f"   {'factor':<8}{label:>13}{'ann vol':>10}{'var retained':>14}")
+    print("   " + "-" * 45)
     for f in factors.names:
         s = factors.sigma[f]
-        print(f"   {f:<8}{s * 100:>10.3f}%{s * math.sqrt(252) * 100:>9.1f}%"
+        print(f"   {f:<8}{s * 100:>12.3f}%{s * math.sqrt(per_year) * 100:>9.1f}%"
               f"{factors.variance_retained[f] * 100:>13.1f}%")
+    if period_days > 1:
+        print(f"\n   Volatilities above are per {args.return_period} period. They are")
+        print(f"   converted to DAILY-equivalent (divided by sqrt({period_days})) before")
+        print("   being saved, because the exposure model consumes daily sigmas.")
 
     print("\n   Raw proxy correlations BEFORE orthogonalization — the overlap the")
     print("   factor model removes:")
@@ -351,6 +582,35 @@ def main() -> int:
     print("   removing the earlier factors. A LOW number means that proxy was")
     print("   mostly explained by the ones before it — precisely the double-")
     print("   counting an unorthogonalized model would have hidden.")
+
+    # ---- synchronicity ---------------------------------------------------
+    # Runs against the FIRST factor, which is both the reference calendar and
+    # where the live anomaly appeared. Date alignment can pass while this fails:
+    # same day, different moment.
+    _hr("2b. SYNCHRONICITY CHECK")
+    ref_factor = factors.names[0]
+    profiles = []
+    fser = factors.series[ref_factor]
+    for name in sorted(inst_rets):
+        series = inst_rets[name]
+        y: list = []
+        x: list = []
+        for pos, row in enumerate(kept):
+            if row >= len(series):
+                continue
+            v = series[row]
+            if v is None or not math.isfinite(v):
+                continue
+            y.append(float(v))
+            x.append(fser[pos])
+        if len(y) < 100:
+            continue
+        profiles.append(synchronicity_profile(y, x, 2, name, ref_factor))
+    print(render_synchronicity(profiles))
+    if args.return_period == "daily":
+        print("\n   Caveat: lags here are counted in SURVIVING observations, not")
+        print("   calendar days, so for a series with gaps a 'lag 1' may span more")
+        print("   than one day. It is a strong signal, not a precise measurement.")
 
     # ---- betas -----------------------------------------------------------
     try:
@@ -385,15 +645,30 @@ def main() -> int:
         "halflife_days": halflife,
         "winsorize": args.winsorize,
         "min_obs": args.min_obs,
+        "return_period": args.return_period,
+        "period_days": period_days,
+        "sigma_basis": "daily",
         "n_factor_obs": factors.n_obs,
         "date_range": [dates[0], dates[-1]],
         "orthogonalization_order": list(ORTHOGONALIZATION_ORDER),
-        "factor_proxies": {f: s for f, (s, _sg, _d) in FACTOR_PROXIES.items()},
+        "factor_baskets": {f: list(c) for f, (c, _d) in FACTOR_BASKETS.items()},
+        "basket_weights": basket_weights,
         "variance_retained": dict(factors.variance_retained),
         "orthogonality_error": factors.orthogonality_error(),
         "skipped": skipped,
     }
-    save_betas(book, args.out, meta=meta)
+    # Convert volatilities to DAILY-equivalent before persisting. Betas are ~
+    # horizon-invariant and are left alone; sigmas are not. The exposure model
+    # consumes daily sigmas (factor_daily_risk, portfolio_daily_risk), so saving
+    # weekly sigmas would silently inflate every reported risk figure by sqrt(5).
+    to_save = book
+    if period_days > 1:
+        to_save = book.scale_sigmas(1.0 / math.sqrt(period_days))
+        print(f"\n  Volatilities converted to daily-equivalent "
+              f"(divided by sqrt({period_days})) so the exposure model reads them "
+              f"correctly.")
+
+    save_betas(to_save, args.out, meta=meta)
 
     _hr("SAVED")
     print(f"  {args.out}")
