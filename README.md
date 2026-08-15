@@ -143,6 +143,26 @@ connector (`src/connectors/mt5_reader.py`) contains no `order_send`, no
 
 ## Getting started
 
+### 0. Check what is missing
+
+```bash
+python scripts/preflight.py
+```
+
+Read-only, opens no orders, writes no files. Run it first and again whenever
+something does not work. It exists because the three setup steps have non-obvious
+ordering dependencies:
+
+| Script | Needs MT5 | Needs internet | Needs config | Needs betas |
+|---|---|---|---|---|
+| `check_account_mode.py` | **yes** | no | no | no |
+| `estimate_betas.py` | no | **yes** | no | no |
+| `measure_exposure.py` | **yes** | no | **yes** | **yes** |
+
+So running them in the wrong order, or on the wrong machine, fails in ways whose
+error messages do not obviously point at the real cause. Preflight checks each
+prerequisite and prints the single command that fixes the first broken thing.
+
 ### 1. Answer the account question (Windows, MT5 terminal open)
 
 ```bash
@@ -247,6 +267,19 @@ scripts/
   estimate_betas.py       the beta + concentration study
   measure_exposure.py     observe mode (--demo works anywhere)
 ```
+
+### Requirements
+
+**Python 3.9 or newer.** Verified on 3.9, 3.10, 3.11, 3.12, 3.13 and 3.14 — the
+demo pipeline produces identical numbers on all of them. `tests/test_python_compatibility.py`
+enforces the floor with an AST check, because the usual way to break it (a
+module-level `X | None` type alias, which Python evaluates at import time even
+with `from __future__ import annotations`) only fails on the *older* interpreter
+and with an error message that does not point at the cause. That bug shipped in
+the first Phase 1 commit and was caught by running `preflight.py` under 3.9.
+
+`MetaTrader5` is needed only for reading a live account, and only exists on
+Windows. `PyYAML` is optional. Nothing else.
 
 ### Why no pandas or numpy
 

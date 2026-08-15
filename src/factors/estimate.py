@@ -23,6 +23,7 @@ sizes a wrong hedge.
 from __future__ import annotations
 
 import math
+from typing import List, Optional
 
 from .book import BetaBook
 from .math_core import (
@@ -34,7 +35,12 @@ from .math_core import (
     winsorize,
 )
 
-Series = list[float | None]
+#: A price or return series with gaps. `Optional[float]` rather than `float | None`
+#: because this is a MODULE-LEVEL alias, which Python evaluates at import time —
+#: `from __future__ import annotations` only defers annotations, not assignments.
+#: The PEP 604 `|` form would make the whole package require Python 3.10, and
+#: Tradingbot's VPS may well be on 3.9.
+Series = List[Optional[float]]
 
 
 # ---------------------------------------------------------------------------
