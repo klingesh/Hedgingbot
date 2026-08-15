@@ -418,7 +418,7 @@ def test_render_synchronicity_all_clear():
     inst = [0.9 * v + rng.normal(0.0, 0.001) for v in f]
 
     text = render_synchronicity([synchronicity_profile(inst, f, 2, "x", "USD")])
-    assert "look synchronous" in text
+    assert "No synchronicity problems" in text
     assert "NON-SYNCHRONOUS" not in text
 
 
@@ -552,3 +552,167 @@ def test_weekly_resampling_repairs_an_asynchronous_beta():
     assert weekly == pytest.approx(true_beta, abs=0.25), (
         f"weekly beta should approach the true {true_beta}, got {weekly:.2f}"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# False positive: "ASYNCHRONOUS" for a genuinely unrelated instrument
+# ---------------------------------------------------------------------------
+
+
+def test_unrelated_instrument_is_not_branded_asynchronous():
+    """The live weekly run flagged BRENT, WTI and NATGAS as ASYNCHRONOUS with
+    91-96% leakage. Their lag-0 correlation with the dollar factor was ~0.01 —
+    they are simply unrelated to the dollar, not mis-timed.
+
+    When the true correlation is zero, every scrap of measured correlation is
+    noise at some lag, so `leakage` (a share of a near-zero total) reads ~95% and
+    the verdict fires. That would send someone hunting a data bug that does not
+    exist.
+    """
+    from src.data.diagnostics import synchronicity_profile
+
+    rng = LCG(61)
+    f = rng.normals(3000, 0.0, 0.01)
+    unrelated = rng.normals(3000, 0.0, 0.02)      # independent of f
+
+    p = synchronicity_profile(unrelated, f, max_lag=2, name="BRENT", factor="USD")
+
+    assert p.peak_abs_correlation < 0.15, "test setup: must be genuinely unrelated"
+    assert p.verdict() == "no relation", (
+        f"expected 'no relation', got {p.verdict()!r} with leak "
+        f"{p.leakage * 100:.0f}%"
+    )
+    # The leak metric IS large and meaningless here — that is the whole point.
+    assert p.leakage > 0.4
+
+
+def test_unrelated_series_are_reported_separately_not_as_a_data_problem():
+    from src.data.diagnostics import render_synchronicity, synchronicity_profile
+
+    rng = LCG(62)
+    f = rng.normals(2500, 0.0, 0.01)
+    unrelated = rng.normals(2500, 0.0, 0.02)
+    real = [0.9 * v + rng.normal(0.0, 0.002) for v in f]
+
+    text = render_synchronicity([
+        synchronicity_profile(unrelated, f, 2, "BRENT", "USD"),
+        synchronicity_profile(real, f, 2, "EURUSD", "USD"),
+    ])
+
+    assert "NO RELATION to this factor" in text
+    assert "BRENT" in text
+    assert "carries no meaning" in text
+    assert "NON-SYNCHRONOUS DATA" not in text, (
+        "an unrelated instrument must not raise a data-quality alarm"
+    )
+
+
+def test_a_real_async_series_still_fires_alongside_unrelated_ones():
+    """The floor must not silence genuine problems."""
+    from src.data.diagnostics import render_synchronicity, synchronicity_profile
+
+    rng = LCG(63)
+    f = rng.normals(3000, 0.0, 0.01)
+    unrelated = rng.normals(3000, 0.0, 0.02)
+    smeared = [0.5 * f[i] + 0.5 * f[i - 1] if i else f[i] for i in range(len(f))]
+
+    profiles = [
+        synchronicity_profile(unrelated, f, 2, "BRENT", "USD"),
+        synchronicity_profile(smeared, f, 2, "FXLIKE", "USD"),
+    ]
+    text = render_synchronicity(profiles, max_leakage=0.30)
+
+    assert "NON-SYNCHRONOUS DATA" in text
+    assert "FXLIKE" in text.split("NON-SYNCHRONOUS DATA")[1]
+    assert "NO RELATION" in text
+
+
+# ---------------------------------------------------------------------------
+# Sigma horizon conversion — the bug that would corrupt every risk number
+# ---------------------------------------------------------------------------
+
+
+def test_scale_sigmas_converts_weekly_to_daily_equivalent():
+    """A weekly beta file stores weekly sigmas, but exposure/model.py consumes
+    them as DAILY (factor_daily_risk, portfolio_daily_risk). Unconverted, every
+    reported risk figure is inflated by sqrt(5) ~ 2.24x."""
+    import math as _math
+
+    from src.factors.book import BetaBook
+
+    weekly = BetaBook(
+        factors=("USD", "RISK"),
+        betas={"EURUSD": {"USD": -0.96, "RISK": 0.0}},
+        sigma={"EURUSD": 0.0097},          # weekly
+        resid_sigma={"EURUSD": 0.0045},
+        factor_sigma={"USD": 0.00896, "RISK": 0.02306},
+    )
+
+    daily = weekly.scale_sigmas(1.0 / _math.sqrt(5))
+
+    assert daily.sigma("EURUSD") == pytest.approx(0.0097 / _math.sqrt(5))
+    assert daily.resid_sigma("EURUSD") == pytest.approx(0.0045 / _math.sqrt(5))
+    assert daily.factor_sigma("USD") == pytest.approx(0.00896 / _math.sqrt(5))
+    # Betas are horizon-invariant and must NOT be touched.
+    assert daily.beta("EURUSD", "USD") == pytest.approx(-0.96)
+    # Purity is a ratio of variance contributions, so uniform scaling leaves it be.
+    assert daily.purity("EURUSD", "USD") == pytest.approx(
+        weekly.purity("EURUSD", "USD")
+    )
+    # The original is unchanged.
+    assert weekly.sigma("EURUSD") == pytest.approx(0.0097)
+
+
+def test_scale_sigmas_rejects_bad_factors():
+    from src.factors.book import BetaBook
+
+    b = BetaBook(factors=("USD",), betas={"X": {"USD": 1.0}})
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and > 0"):
+            b.scale_sigmas(bad)
+
+
+def test_weekly_risk_numbers_match_daily_after_conversion():
+    """End-to-end: a weekly-estimated book, converted, must produce a
+    portfolio_daily_risk in the same ballpark as a daily-estimated one — not
+    2.24x larger."""
+    import math as _math
+
+    from src.exposure.model import InstrumentSpec, Position, compute_exposure
+    from src.factors.book import BetaBook
+
+    spec = InstrumentSpec("EURUSD", 0.00001, 1.0, logical="EURUSD")
+    pos = [Position("EURUSD", 1, 0.1, 1.157, logical="EURUSD")]
+
+    daily_book = BetaBook(
+        factors=("USD",), betas={"EURUSD": {"USD": -0.96}},
+        sigma={"EURUSD": 0.0043}, resid_sigma={"EURUSD": 0.0020},
+        factor_sigma={"USD": 0.00401},
+    )
+    weekly_book = BetaBook(
+        factors=("USD",), betas={"EURUSD": {"USD": -0.96}},
+        sigma={"EURUSD": 0.0043 * _math.sqrt(5)},
+        resid_sigma={"EURUSD": 0.0020 * _math.sqrt(5)},
+        factor_sigma={"USD": 0.00401 * _math.sqrt(5)},
+    )
+
+    d = compute_exposure(pos, {"EURUSD": spec}, daily_book, 10_000.0)
+    raw_w = compute_exposure(pos, {"EURUSD": spec}, weekly_book, 10_000.0)
+    fixed_w = compute_exposure(
+        pos, {"EURUSD": spec}, weekly_book.scale_sigmas(1 / _math.sqrt(5)), 10_000.0
+    )
+
+    # Unconverted, the weekly book overstates daily risk by sqrt(5).
+    assert raw_w.portfolio_daily_risk == pytest.approx(
+        d.portfolio_daily_risk * _math.sqrt(5), rel=1e-6
+    )
+    # Converted, it agrees with the daily book.
+    assert fixed_w.portfolio_daily_risk == pytest.approx(
+        d.portfolio_daily_risk, rel=1e-9
+    )
+    # Leverage is sigma-free, so it must be identical in all three.
+    for r in (d, raw_w, fixed_w):
+        assert r.factor_leverage["USD"] == pytest.approx(
+            d.factor_leverage["USD"], rel=1e-12
+        )

@@ -305,10 +305,14 @@ def hedge_purity_table(book, candidates: list[str]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Estimate factor betas for the overlay.")
     ap.add_argument("--years", type=float, default=8.0)
-    ap.add_argument("--halflife", type=float, default=252.0,
-                    help="exponential weighting half-life in days; 0 => equal weight")
+    ap.add_argument("--halflife", type=float, default=None,
+                    help="exponential weighting half-life, in PERIODS; 0 => equal "
+                         "weight. Default scales with --return-period (252 daily, "
+                         "~50 weekly)")
     ap.add_argument("--winsorize", type=float, default=0.005)
-    ap.add_argument("--min-obs", type=int, default=250)
+    ap.add_argument("--min-obs", type=int, default=None,
+                    help="minimum observations per instrument, in PERIODS. Default "
+                         "scales with --return-period (250 daily, 50 weekly)")
     ap.add_argument("--out", default=os.path.join("betas", "betas_latest.json"))
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--skip-stability", action="store_true")
@@ -331,6 +335,26 @@ def main() -> int:
     args = ap.parse_args()
 
     halflife = args.halflife if args.halflife and args.halflife > 0 else None
+
+    # Trading days per return period, used for both annualization and the
+    # daily-equivalent sigma conversion.
+    period_days = {"daily": 1, "weekly": 5, "biweekly": 10, "monthly": 21}[
+        args.return_period
+    ]
+
+    # --min-obs and --halflife are expressed in PERIODS, so their daily defaults
+    # are wrong for a weekly run. 250 weekly observations is five years, and the
+    # stability check (which wants 4x min_obs) then becomes impossible: an 8-year
+    # sample is only ~417 weeks. Scale the defaults unless explicitly overridden.
+    if args.min_obs is None:
+        args.min_obs = max(30, int(round(250 / period_days)))
+        if period_days > 1:
+            print(f"  --min-obs defaulted to {args.min_obs} "
+                  f"({args.return_period} periods, scaled from 250 daily)")
+    if args.halflife is None:
+        halflife = max(20.0, 252.0 / period_days)
+    else:
+        halflife = args.halflife if args.halflife > 0 else None
 
     # ---- fetch -----------------------------------------------------------
     _hr("FETCHING DAILY HISTORY")
@@ -479,12 +503,21 @@ def main() -> int:
     print(f"   halflife={halflife}  winsorize={args.winsorize}")
     print(f"   orthogonality error (max |corr| off-diagonal) = "
           f"{factors.orthogonality_error():.2e}\n")
-    print(f"   {'factor':<8}{'daily vol':>11}{'ann vol':>10}{'var retained':>14}")
-    print("   " + "-" * 41)
+    # Annualize with the ACTUAL number of periods per year. Hardcoding 252 here
+    # printed ENERGY at 94.8% annual vol on weekly data — sqrt(252) applied to a
+    # weekly sigma, i.e. 2.2x too big.
+    per_year = 252.0 / float(period_days)
+    label = f"{args.return_period} vol"
+    print(f"   {'factor':<8}{label:>13}{'ann vol':>10}{'var retained':>14}")
+    print("   " + "-" * 45)
     for f in factors.names:
         s = factors.sigma[f]
-        print(f"   {f:<8}{s * 100:>10.3f}%{s * math.sqrt(252) * 100:>9.1f}%"
+        print(f"   {f:<8}{s * 100:>12.3f}%{s * math.sqrt(per_year) * 100:>9.1f}%"
               f"{factors.variance_retained[f] * 100:>13.1f}%")
+    if period_days > 1:
+        print(f"\n   Volatilities above are per {args.return_period} period. They are")
+        print(f"   converted to DAILY-equivalent (divided by sqrt({period_days})) before")
+        print("   being saved, because the exposure model consumes daily sigmas.")
 
     print("\n   Raw proxy correlations BEFORE orthogonalization — the overlap the")
     print("   factor model removes:")
@@ -565,6 +598,8 @@ def main() -> int:
         "winsorize": args.winsorize,
         "min_obs": args.min_obs,
         "return_period": args.return_period,
+        "period_days": period_days,
+        "sigma_basis": "daily",
         "n_factor_obs": factors.n_obs,
         "date_range": [dates[0], dates[-1]],
         "orthogonalization_order": list(ORTHOGONALIZATION_ORDER),
@@ -573,7 +608,18 @@ def main() -> int:
         "orthogonality_error": factors.orthogonality_error(),
         "skipped": skipped,
     }
-    save_betas(book, args.out, meta=meta)
+    # Convert volatilities to DAILY-equivalent before persisting. Betas are ~
+    # horizon-invariant and are left alone; sigmas are not. The exposure model
+    # consumes daily sigmas (factor_daily_risk, portfolio_daily_risk), so saving
+    # weekly sigmas would silently inflate every reported risk figure by sqrt(5).
+    to_save = book
+    if period_days > 1:
+        to_save = book.scale_sigmas(1.0 / math.sqrt(period_days))
+        print(f"\n  Volatilities converted to daily-equivalent "
+              f"(divided by sqrt({period_days})) so the exposure model reads them "
+              f"correctly.")
+
+    save_betas(to_save, args.out, meta=meta)
 
     _hr("SAVED")
     print(f"  {args.out}")

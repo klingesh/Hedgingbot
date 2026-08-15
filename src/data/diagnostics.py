@@ -407,7 +407,29 @@ class Synchronicity:
         """
         return sum(self.betas.values())
 
-    def verdict(self, max_leakage: float = 0.45) -> str:
+    @property
+    def peak_abs_correlation(self) -> float:
+        if not self.correlations:
+            return 0.0
+        return max(abs(v) for v in self.correlations.values())
+
+    def verdict(self, max_leakage: float = 0.45, min_abs_corr: float = 0.15) -> str:
+        """Grade synchronicity, but only where a relationship exists at all.
+
+        The min_abs_corr floor is not a nicety, it fixes a false positive that
+        appeared on live data. BRENT, WTI and NATGAS have essentially NO weekly
+        correlation with the dollar factor (lag-0 around 0.01). When the true
+        correlation is zero, every scrap of measured correlation is noise sitting
+        at some lag, so `leakage` — a share of a near-zero total — reads 91-96%
+        and the series gets branded ASYNCHRONOUS.
+
+        That is backwards: those instruments are not mis-timed, they are simply
+        unrelated to the dollar. Reporting them as a data problem would send
+        someone chasing a bug that does not exist. Below the floor we say so
+        plainly instead.
+        """
+        if self.peak_abs_correlation < min_abs_corr:
+            return "no relation"
         if self.best_lag != 0 and abs(self.correlations.get(self.best_lag, 0.0)) > \
                 abs(self.contemporaneous) * 1.15:
             return "ASYNCHRONOUS"
@@ -465,7 +487,9 @@ def synchronicity_profile(
 
 
 def render_synchronicity(
-    profiles: List[Synchronicity], max_leakage: float = 0.45
+    profiles: List[Synchronicity],
+    max_leakage: float = 0.45,
+    min_abs_corr: float = 0.15,
 ) -> str:
     """Table of lagged correlations, one row per instrument."""
     if not profiles:
@@ -492,7 +516,7 @@ def render_synchronicity(
         row += f"{p.leakage * 100:>6.0f}%"
         row += f"{p.betas.get(0, 0.0):>8.2f}"
         row += f"{p.dimson_beta:>8.2f}"
-        row += f"{p.verdict(max_leakage):>15}"
+        row += f"{p.verdict(max_leakage, min_abs_corr):>15}"
         lines.append(row)
 
     lines += ["", "   * = lag with the strongest |correlation|",
@@ -501,7 +525,10 @@ def render_synchronicity(
               "            which is the economically meaningful sensitivity when",
               "            the series are not synchronous)"]
 
-    bad = [p for p in profiles if p.verdict(max_leakage) != "ok"]
+    bad = [p for p in profiles
+           if p.verdict(max_leakage, min_abs_corr) not in ("ok", "no relation")]
+    unrelated = [p for p in profiles
+                 if p.verdict(max_leakage, min_abs_corr) == "no relation"]
     if bad:
         lines += [
             "",
@@ -510,7 +537,7 @@ def render_synchronicity(
         ]
         for p in bad:
             lines.append(
-                f"     {p.name:<12} {p.verdict(max_leakage):<13} "
+                f"     {p.name:<12} {p.verdict(max_leakage, min_abs_corr):<13} "
                 f"beta0 {p.betas.get(0, 0.0):+.2f} vs dimson "
                 f"{p.dimson_beta:+.2f}  (leak {p.leakage * 100:.0f}%)"
             )
@@ -528,6 +555,19 @@ def render_synchronicity(
             "   biased rather than merely noisy.",
         ]
     else:
-        lines += ["", "   All series look synchronous with the factor."]
+        lines += ["", "   No synchronicity problems among series that have a",
+                  "   measurable relationship with this factor."]
+
+    if unrelated:
+        lines += [
+            "",
+            f"   NO RELATION to this factor (peak |corr| < {min_abs_corr}):",
+            "     " + ", ".join(p.name for p in unrelated),
+            "",
+            "   Not a data problem. These instruments simply have little or no",
+            "   exposure to this factor, so their 'leak' percentage is a ratio of",
+            "   noise to noise and carries no meaning. Ignore their leak and",
+            "   dimson columns.",
+        ]
 
     return "\n".join(lines)
