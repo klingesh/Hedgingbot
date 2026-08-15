@@ -309,3 +309,156 @@ def test_align_price_frame_unions_mismatched_date_axes(monkeypatch):
     assert dates == ["2020-01-01", "2020-01-02", "2020-01-03"]
     assert frame["A"] == [1.0, 2.0, None]
     assert frame["B"] == [None, 3.0, 4.0]
+
+
+
+# ---------------------------------------------------------------------------
+# Alignment gate
+# ---------------------------------------------------------------------------
+
+
+def _misaligned_frame(n: int = 900):
+    """A frame where the instrument's labels are one day later than the factors."""
+    from datetime import date, timedelta
+
+    rng = LCG(808)
+
+    def bdays(start: str, count: int) -> list[str]:
+        d = date.fromisoformat(start)
+        out: list[str] = []
+        while len(out) < count:
+            if d.weekday() < 5:
+                out.append(d.isoformat())
+            d += timedelta(days=1)
+        return out
+
+    factor_days = bdays("2019-01-01", n)
+    shifted_days = [
+        (date.fromisoformat(d) + timedelta(days=1)).isoformat() for d in factor_days
+    ]
+    combined = sorted(set(factor_days) | set(shifted_days))
+    idx = {d: i for i, d in enumerate(combined)}
+
+    frame: dict[str, list] = {}
+    for f in FACTOR_PROXIES:
+        col = [None] * len(combined)
+        px = prices_from_returns(rng.normals(n - 1, 0.0, 0.01))
+        for i, d in enumerate(factor_days):
+            col[idx[d]] = px[i]
+        frame[f"__factor_{f}"] = col
+
+    inst = [None] * len(combined)
+    px = prices_from_returns(rng.normals(n - 1, 0.0, 0.012))
+    for i, d in enumerate(shifted_days):
+        inst[idx[d]] = px[i]
+    frame["GOLD"] = inst
+
+    return combined, frame
+
+
+def test_misaligned_data_stops_the_study(monkeypatch, capsys, tmp_path):
+    """Refuse to write betas from data whose dates do not line up."""
+    import os
+
+    dates, frame = _misaligned_frame()
+    out = os.path.join(str(tmp_path), "betas.json")
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "100", "--out", out])
+
+    assert rc == 1
+    text = capsys.readouterr().out
+    assert "MISALIGNED" in text
+    assert "STOPPING" in text
+    assert "--align-to-reference" in text
+    assert not os.path.exists(out), "no beta file may be written from bad data"
+
+
+def test_ignore_misalignment_proceeds_but_is_labelled_dangerous(monkeypatch, capsys,
+                                                                tmp_path):
+    import os
+
+    dates, frame = _misaligned_frame()
+    out = os.path.join(str(tmp_path), "betas.json")
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "100", "--ignore-misalignment", "--out", out])
+
+    assert rc == 0
+    assert "MISALIGNED" in capsys.readouterr().out
+    assert os.path.exists(out)
+
+
+def test_align_to_reference_is_not_blocked_by_the_gate(monkeypatch, capsys, tmp_path):
+    """--align-to-reference IS the fix, so the gate demanding a fix must not
+    block it. This was a real ordering bug: the early return fired first and the
+    flag could never take effect."""
+    import os
+
+    dates, frame = _misaligned_frame()
+    out = os.path.join(str(tmp_path), "betas.json")
+
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "100", "--align-to-reference", "--out", out])
+
+    assert rc == 0, "aligning must be allowed to proceed"
+    text = capsys.readouterr().out
+    assert "Applied label offsets" in text
+    assert "prices unchanged" in text
+    assert os.path.exists(out)
+
+
+def test_align_to_reference_restores_overlap(monkeypatch, capsys, tmp_path):
+    """After aligning, the instrument must be estimated on far more observations."""
+    import os
+
+    from src.factors.store import load_betas
+
+    dates, frame = _misaligned_frame()
+
+    out_bad = os.path.join(str(tmp_path), "bad.json")
+    run_with_frame(monkeypatch, dates, {k: list(v) for k, v in frame.items()},
+                   ["--min-obs", "50", "--ignore-misalignment", "--out", out_bad])
+    bad, _ = load_betas(out_bad, max_age_days=1)
+
+    out_fixed = os.path.join(str(tmp_path), "fixed.json")
+    run_with_frame(monkeypatch, dates, {k: list(v) for k, v in frame.items()},
+                   ["--min-obs", "50", "--align-to-reference", "--out", out_fixed])
+    fixed, _ = load_betas(out_fixed, max_age_days=1)
+
+    # Aligning must reach the FULL factor sample, not merely more of it.
+    assert fixed.n_obs("GOLD") > bad.n_obs("GOLD"), (
+        f"aligning should recover observations: "
+        f"{bad.n_obs('GOLD')} -> {fixed.n_obs('GOLD')}"
+    )
+
+    # Note how MILD the observation loss is: a one-weekday shift still lands
+    # Mon->Tue, Tue->Wed, Wed->Thu, Thu->Fri on valid weekdays, so only the
+    # Friday->Saturday roll is dropped. Roughly 75% of observations survive.
+    #
+    # That is precisely what makes this bug dangerous. It does not announce
+    # itself as missing data -- the row counts look fine. The damage is that the
+    # surviving observations are MISPAIRED: one day's instrument return regressed
+    # against the next day's factor. R^2 collapses while everything else looks
+    # healthy. See test_alignment_diagnostics.test_reproduces_the_live_fx_symptom
+    # for the R^2 > 0.99 -> < 0.15 demonstration.
+    assert bad.n_obs("GOLD") > 0.5 * fixed.n_obs("GOLD"), (
+        "documents that a shift loses only a minority of observations, which is "
+        "why row counts alone cannot detect it"
+    )
+
+
+def test_circularity_warning_is_printed(monkeypatch, capsys, tmp_path):
+    """GOLD shares GC=F with the METALS proxy in the shipped definitions, which
+    makes its R2 definitional rather than measured. The user must be told."""
+    import os
+
+    dates, frame = make_frame(900, seed=44, instruments=("GOLD", "EURUSD"))
+    rc = run_with_frame(monkeypatch, dates, frame,
+                        ["--min-obs", "200", "--skip-stability",
+                         "--out", os.path.join(str(tmp_path), "b.json")])
+
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "CIRCULARITY WARNING" in text
+    assert "GOLD" in text and "METALS" in text

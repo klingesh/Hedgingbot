@@ -29,6 +29,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.data.diagnostics import (                                       # noqa: E402
+    diagnose_alignment,
+    find_circular_instruments,
+)
 from src.data.yahoo import align_price_frame                            # noqa: E402
 from src.factors.definitions import (                                    # noqa: E402
     FACTOR_PROXIES,
@@ -55,6 +59,44 @@ def _hr(title: str) -> None:
     print("\n" + "=" * 78)
     print(title)
     print("=" * 78)
+
+
+def _apply_offsets(dates, frame, report) -> dict:
+    """Re-file each misaligned series onto the reference calendar, in place.
+
+    Only the date LABEL a price is filed under changes; no price is altered,
+    invented or interpolated. This corrects a source-metadata artefact — Yahoo
+    timestamps FX and futures bars on different session boundaries — rather than
+    massaging data to fit.
+
+    Returns {series_name: applied_offset}.
+    """
+    from datetime import date as _date
+    from datetime import timedelta as _timedelta
+
+    index = {d: i for i, d in enumerate(dates)}
+    applied: dict = {}
+
+    for s in report.misaligned():
+        column = frame.get(s.name)
+        if column is None:
+            continue
+        shifted = [None] * len(dates)
+        delta = _timedelta(days=s.best_offset)
+        for i, value in enumerate(column):
+            if value is None:
+                continue
+            try:
+                target = (_date.fromisoformat(dates[i]) + delta).isoformat()
+            except ValueError:
+                continue
+            j = index.get(target)
+            if j is not None:
+                shifted[j] = value
+        frame[s.name] = shifted
+        applied[s.name] = s.best_offset
+
+    return applied
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +289,17 @@ def main() -> int:
     ap.add_argument("--out", default=os.path.join("betas", "betas_latest.json"))
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--skip-stability", action="store_true")
+    ap.add_argument("--max-offset", type=int, default=2,
+                    help="how many days of date-label shift to test for misalignment")
+    ap.add_argument("--min-align-gain", type=float, default=0.10,
+                    help="relative overlap gain from a shift before calling a series "
+                         "misaligned")
+    ap.add_argument("--align-to-reference", action="store_true",
+                    help="re-file misaligned series onto the factor calendar. Changes "
+                         "only the date label a price is filed under, never a price.")
+    ap.add_argument("--ignore-misalignment", action="store_true",
+                    help="write betas even from misaligned data. Do not use this "
+                         "unless you know exactly why.")
     args = ap.parse_args()
 
     halflife = args.halflife if args.halflife and args.halflife > 0 else None
@@ -286,6 +339,62 @@ def main() -> int:
 
     print(f"\n  Common date axis: {len(dates)} days "
           f"({dates[0]} -> {dates[-1]})")
+
+    # ---- data integrity, BEFORE any maths -------------------------------
+    # Betas from misaligned dates look plausible and are worthless, so this runs
+    # first and can stop the whole study.
+    ref_col = f"__factor_{ORTHOGONALIZATION_ORDER[0]}"
+    if ref_col in frame:
+        _hr("0. DATA ALIGNMENT CHECK")
+        align_report = diagnose_alignment(
+            dates, frame, reference=ref_col,
+            max_offset=args.max_offset,
+            min_gain=args.min_align_gain,
+        )
+        print(align_report.render())
+
+        # --align-to-reference is the FIX, so it must not be blocked by the gate
+        # that exists to demand a fix.
+        if (align_report.misaligned() and not args.ignore_misalignment
+                and not args.align_to_reference):
+            print("\n" + "=" * 78)
+            print("STOPPING: refusing to write betas from misaligned data.")
+            print("=" * 78)
+            print("\nThe series above are filed under date labels that disagree with")
+            print("the factor calendar by a day. Regressing them pairs one day's")
+            print("return against another day's factor, which drives R^2 toward 0 and")
+            print("betas toward 0 — and the output looks perfectly reasonable, which")
+            print("is what makes it dangerous.")
+            print("\nOptions:")
+            print("  --align-to-reference   snap every series onto the factor calendar")
+            print("                         by applying its best offset (recommended;")
+            print("                         it corrects a labelling artefact, it does")
+            print("                         not alter any price)")
+            print("  --ignore-misalignment  proceed anyway and DO NOT trust the result")
+            print("\nNothing was written. Any existing beta file is untouched.")
+            return 1
+
+        if args.align_to_reference:
+            fixed = _apply_offsets(dates, frame, align_report)
+            if fixed:
+                print(f"\n  Applied label offsets: "
+                      + ", ".join(f"{n}{o:+d}" for n, o in fixed.items()))
+                print("  (prices unchanged — only the date each price is filed under)")
+
+    # ---- circularity: is a traded instrument its own factor proxy? -------
+    circular = find_circular_instruments(
+        {f: sym for f, (sym, _s, _d) in FACTOR_PROXIES.items()},
+        {name: ysym for name, (ysym, _b, _c) in TRADINGBOT_PORTFOLIO.items()},
+    )
+    if circular:
+        print("\n  *** CIRCULARITY WARNING ***")
+        for inst, fac in sorted(circular.items()):
+            print(f"    {inst} uses the SAME price series as the {fac} factor proxy")
+        print("    These instruments are regressed partly on THEMSELVES, so they")
+        print("    will report R2 ~ 1.00 and idiosyncratic vol ~ 0.00. That is an")
+        print("    artefact, not a measurement: the risk model will believe they")
+        print("    have no unexplained risk and are perfectly hedgeable. Treat")
+        print("    their betas as definitional rather than estimated.")
 
     factor_prices: dict[str, list] = {}
     for f, (_sym, sign, _desc) in FACTOR_PROXIES.items():

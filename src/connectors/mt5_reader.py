@@ -60,6 +60,8 @@ class AccountState:
     margin_mode: int
     trade_allowed: bool
     trade_expert: bool
+    server: str = ""
+    company: str = ""
 
     @property
     def margin_mode_name(self) -> str:
@@ -153,6 +155,8 @@ class MT5Reader:
             margin_mode=int(getattr(a, "margin_mode", -1)),
             trade_allowed=bool(a.trade_allowed),
             trade_expert=bool(a.trade_expert),
+            server=str(getattr(a, "server", "") or ""),
+            company=str(getattr(a, "company", "") or ""),
         )
 
     def margin_mode(self) -> str:
