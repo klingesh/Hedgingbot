@@ -1,7 +1,14 @@
+from .baskets import (
+    build_basket,
+    circularity_report,
+    inverse_vol_weights,
+    self_weight,
+)
 from .book import BetaBook
 from .definitions import (
-    FACTORS,
+    FACTOR_BASKETS,
     FACTOR_PROXIES,
+    FACTORS,
     HEDGE_CANDIDATES,
     ORTHOGONALIZATION_ORDER,
     PRIOR_BETAS,
@@ -33,6 +40,11 @@ from .store import StaleBetasError, load_betas, save_betas
 
 __all__ = [
     "BetaBook",
+    "FACTOR_BASKETS",
+    "build_basket",
+    "circularity_report",
+    "inverse_vol_weights",
+    "self_weight",
     "FACTORS",
     "FACTOR_PROXIES",
     "HEDGE_CANDIDATES",

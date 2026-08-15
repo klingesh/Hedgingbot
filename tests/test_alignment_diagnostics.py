@@ -274,19 +274,48 @@ def test_no_circularity_when_proxies_are_distinct():
     ) == {}
 
 
-def test_shipped_definitions_are_checked_for_circularity():
-    """Documents the CURRENT state of the shipped config, so a future change to
-    basket proxies visibly updates this expectation."""
-    from src.factors.definitions import FACTOR_PROXIES, TRADINGBOT_PORTFOLIO
+def test_no_traded_instrument_is_a_whole_factor_in_the_shipped_config():
+    """The regression this whole basket change exists to prevent.
 
-    circular = find_circular_instruments(
-        {f: sym for f, (sym, _s, _d) in FACTOR_PROXIES.items()},
-        {n: ysym for n, (ysym, _b, _c) in TRADINGBOT_PORTFOLIO.items()},
+    find_circular_instruments compares against SINGLE-series factors, so it is now
+    only meaningful for factors that still have one component. The graded
+    self-weight check in factors/baskets.py supersedes it for baskets; this test
+    guards the specific catastrophic case: a TRADED instrument being 100% of a
+    factor, which produces R2 = 1.00 and idio = 0.00.
+    """
+    from src.factors.baskets import self_weight
+    from src.factors.definitions import FACTOR_BASKETS, TRADINGBOT_PORTFOLIO
+
+    # Reconstruct the weights a single-component factor necessarily has.
+    single_component_weights = {
+        factor: {components[0]: 1.0}
+        for factor, (components, _desc) in FACTOR_BASKETS.items()
+        if len(components) == 1
+    }
+
+    offenders = {}
+    for name, (ysym, _b, _c) in TRADINGBOT_PORTFOLIO.items():
+        for factor, weight in self_weight(ysym, single_component_weights).items():
+            if weight > 0.90:
+                offenders[name] = factor
+
+    assert offenders == {}, (
+        f"TRADED instrument(s) are effectively a whole factor: {offenders}. "
+        "Their R2 will read 1.00 and idio 0.00, telling the risk model they have "
+        "no unhedgeable risk. Make that factor a basket in FACTOR_BASKETS."
     )
-    # GOLD is GC=F and so is the METALS proxy; BRENT is BZ=F, ENERGY is CL=F.
-    assert circular == {"GOLD": "METALS"}, (
-        f"shipped circularity changed: {circular}. If proxies moved to baskets "
-        "this should now be empty — update the assertion deliberately."
+
+
+def test_metals_is_a_basket_because_its_members_are_traded():
+    """Documents WHY the METALS basket exists, so it is not 'simplified' back."""
+    from src.factors.definitions import FACTOR_BASKETS, TRADINGBOT_PORTFOLIO
+
+    traded_symbols = {y for _n, (y, _b, _c) in TRADINGBOT_PORTFOLIO.items()}
+    metals_components = set(FACTOR_BASKETS["METALS"][0])
+
+    assert len(metals_components) > 1, "METALS must be a basket, not one series"
+    assert metals_components & traded_symbols, (
+        "the reason METALS is a basket is that its components are traded"
     )
 
 

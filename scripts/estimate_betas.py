@@ -31,14 +31,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.diagnostics import (                                       # noqa: E402
     diagnose_alignment,
-    find_circular_instruments,
-)
-from src.data.diagnostics import (                                       # noqa: E402
     render_synchronicity,
     synchronicity_profile,
 )
 from src.data.yahoo import align_price_frame, to_period                  # noqa: E402
+from src.factors.baskets import build_basket, circularity_report        # noqa: E402
 from src.factors.definitions import (                                    # noqa: E402
+    FACTOR_BASKETS,
     FACTOR_PROXIES,
     FACTORS,
     HEDGE_CANDIDATES,
@@ -359,8 +358,11 @@ def main() -> int:
     # ---- fetch -----------------------------------------------------------
     _hr("FETCHING DAILY HISTORY")
     wanted: dict[str, str] = {}
-    for f, (sym, _sign, _desc) in FACTOR_PROXIES.items():
-        wanted[f"__factor_{f}"] = sym
+    # Every basket component, keyed by its own symbol so components shared between
+    # baskets and instruments are fetched once.
+    for _f, (components, _desc) in FACTOR_BASKETS.items():
+        for sym in components:
+            wanted[f"__cmp_{sym}"] = sym
     for name, (ysym, _b, _c) in TRADINGBOT_PORTFOLIO.items():
         wanted[name] = ysym
     for name, (ysym, _b, _f) in HEDGE_CANDIDATES.items():
@@ -395,7 +397,10 @@ def main() -> int:
     # ---- data integrity, BEFORE any maths -------------------------------
     # Betas from misaligned dates look plausible and are worthless, so this runs
     # first and can stop the whole study.
-    ref_col = f"__factor_{ORTHOGONALIZATION_ORDER[0]}"
+    # Anchor the calendar on the FIRST component of the first factor. Baskets are
+    # built on the intersection of their components, so any one of them defines
+    # the same calendar family.
+    ref_col = f"__cmp_{FACTOR_BASKETS[ORTHOGONALIZATION_ORDER[0]][0][0]}"
     if ref_col in frame:
         _hr("0. DATA ALIGNMENT CHECK")
         align_report = diagnose_alignment(
@@ -433,46 +438,42 @@ def main() -> int:
                       + ", ".join(f"{n}{o:+d}" for n, o in fixed.items()))
                 print("  (prices unchanged — only the date each price is filed under)")
 
-    # ---- circularity: is a traded instrument its own factor proxy? -------
-    circular = find_circular_instruments(
-        {f: sym for f, (sym, _s, _d) in FACTOR_PROXIES.items()},
-        {name: ysym for name, (ysym, _b, _c) in TRADINGBOT_PORTFOLIO.items()},
-    )
-    if circular:
-        print("\n  *** CIRCULARITY WARNING ***")
-        for inst, fac in sorted(circular.items()):
-            print(f"    {inst} uses the SAME price series as the {fac} factor proxy")
-        print("    These instruments are regressed partly on THEMSELVES, so they")
-        print("    will report R2 ~ 1.00 and idiosyncratic vol ~ 0.00. That is an")
-        print("    artefact, not a measurement: the risk model will believe they")
-        print("    have no unexplained risk and are perfectly hedgeable. Treat")
-        print("    their betas as definitional rather than estimated.")
+    # Circularity is now measured quantitatively per factor in section 1b
+    # (self-weight), which is strictly more informative than the old binary
+    # same-series check, so that warning has moved there.
 
-    factor_prices: dict[str, list] = {}
-    for f, (_sym, sign, _desc) in FACTOR_PROXIES.items():
-        col = frame.get(f"__factor_{f}")
-        if col is None:
+    # Apply the proxy sign so a POSITIVE factor return always means the
+    # economically positive direction of the factor's name.
+    signs = {sym: sign for _f, (sym, sign, _d) in FACTOR_PROXIES.items()}
+    component_prices: dict[str, list] = {}
+    for key, col in frame.items():
+        if not key.startswith("__cmp_"):
             continue
-        # Apply the proxy sign so a POSITIVE factor return always means the
-        # economically positive direction of the factor's name.
-        factor_prices[f] = ([1.0 / p if (p and p > 0) else None for p in col]
-                            if sign < 0 else col)
+        sym = key[len("__cmp_"):]
+        component_prices[sym] = (
+            [1.0 / p if (p and p > 0) else None for p in col]
+            if signs.get(sym, 1) < 0 else col
+        )
 
-    missing = [f for f in ORTHOGONALIZATION_ORDER if f not in factor_prices]
-    if missing:
-        print(f"\nFATAL: factor proxy fetch failed for {missing}. Cannot build the "
-              "factor model. Re-run, or edit FACTOR_PROXIES in "
-              "src/factors/definitions.py.")
+    missing_factors = []
+    for f in ORTHOGONALIZATION_ORDER:
+        components, _desc = FACTOR_BASKETS[f]
+        if not any(sym in component_prices for sym in components):
+            missing_factors.append(f)
+    if missing_factors:
+        print(f"\nFATAL: every component failed to fetch for factor(s) "
+              f"{missing_factors}. Cannot build the factor model. Re-run, or edit "
+              "FACTOR_BASKETS in src/factors/definitions.py.")
         return 1
 
-    instrument_prices = {k: v for k, v in frame.items() if not k.startswith("__factor_")}
+    instrument_prices = {k: v for k, v in frame.items() if not k.startswith("__cmp_")}
 
     # ---- optional return-period resampling -------------------------------
     if args.return_period != "daily":
-        merged = dict(factor_prices)
+        merged = dict(component_prices)
         merged.update(instrument_prices)
         dates, merged = to_period(dates, merged, args.return_period)
-        factor_prices = {k: merged[k] for k in factor_prices}
+        component_prices = {k: merged[k] for k in component_prices}
         instrument_prices = {k: merged[k] for k in instrument_prices}
         print(f"\n  Resampled to {args.return_period}: {len(dates)} periods "
               f"({dates[0]} -> {dates[-1]})")
@@ -480,9 +481,56 @@ def main() -> int:
         print("  at the cost of sample size. Use this when the daily betas are")
         print("  BIASED (see the synchronicity report), not merely noisy.")
 
-    # ---- returns ---------------------------------------------------------
-    proxy_rets = returns_from_prices(factor_prices, args.winsorize)
+    # ---- returns, then build the factor baskets --------------------------
+    component_rets = returns_from_prices(component_prices, args.winsorize)
     inst_rets = returns_from_prices(instrument_prices, args.winsorize)
+
+    _hr("1b. FACTOR BASKETS")
+    proxy_rets: dict[str, list] = {}
+    basket_weights: dict[str, dict[str, float]] = {}
+    for f in ORTHOGONALIZATION_ORDER:
+        components, desc = FACTOR_BASKETS[f]
+        available = {s: component_rets[s] for s in components if s in component_rets}
+        dropped = [s for s in components if s not in component_rets]
+        if len(available) == 1:
+            only = next(iter(available))
+            proxy_rets[f] = available[only]
+            basket_weights[f] = {only: 1.0}
+            print(f"   {f:<8} single series {only:<10} {desc}")
+        else:
+            try:
+                series, weights = build_basket(available, halflife=halflife)
+            except ValueError as exc:
+                print(f"\nFATAL: could not build the factor model — the {f} basket "
+                      f"failed: {exc}")
+                print("\nA basket needs a common sample where ALL its components")
+                print("have data, so one short or gappy component limits the whole")
+                print("factor. Try:")
+                print("  * --years 15    (fetch more history)")
+                print("  * --no-cache    (a truncated cache file can cause this)")
+                print(f"  * drop the offending component from FACTOR_BASKETS[{f!r}]")
+                print("    in src/factors/definitions.py")
+                print("\nNothing was written; any existing beta file is untouched.")
+                return 1
+            proxy_rets[f] = series
+            basket_weights[f] = weights
+            detail = "  ".join(f"{s}={w:.0%}" for s, w in sorted(weights.items()))
+            print(f"   {f:<8} basket of {len(available)}: {detail}")
+            print(f"            {desc}")
+        if dropped:
+            print(f"            WARNING: component(s) {dropped} failed to fetch "
+                  f"and were excluded from the basket")
+
+    print("\n   Weights are EQUAL RISK (inverse volatility), so a high-vol member")
+    print("   cannot dominate a factor and mislabel itself as the whole complex.")
+
+    # ---- circularity, now measurable rather than binary -------------------
+    print("\n   CIRCULARITY — how much of each factor is an instrument's own series:")
+    print()
+    all_symbols = {n: y for n, (y, _b, _c) in TRADINGBOT_PORTFOLIO.items()}
+    all_symbols.update({n: y for n, (y, _b, _f) in HEDGE_CANDIDATES.items()})
+    print(circularity_report(all_symbols, basket_weights,
+                             traded=list(TRADINGBOT_PORTFOLIO)))
 
     describe_concentration(inst_rets, list(TRADINGBOT_PORTFOLIO))
 
@@ -603,7 +651,8 @@ def main() -> int:
         "n_factor_obs": factors.n_obs,
         "date_range": [dates[0], dates[-1]],
         "orthogonalization_order": list(ORTHOGONALIZATION_ORDER),
-        "factor_proxies": {f: s for f, (s, _sg, _d) in FACTOR_PROXIES.items()},
+        "factor_baskets": {f: list(c) for f, (c, _d) in FACTOR_BASKETS.items()},
+        "basket_weights": basket_weights,
         "variance_retained": dict(factors.variance_retained),
         "orthogonality_error": factors.orthogonality_error(),
         "skipped": skipped,
