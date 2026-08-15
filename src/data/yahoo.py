@@ -28,6 +28,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import date as _date
+from typing import Dict, List, Tuple
 
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
@@ -231,3 +233,79 @@ def align_price_frame(
     all_dates = sorted({d for m in fetched.values() for d in m})
     frame = {name: [m.get(d) for d in all_dates] for name, m in fetched.items()}
     return all_dates, frame
+
+
+
+# ---------------------------------------------------------------------------
+# Return-period resampling
+# ---------------------------------------------------------------------------
+
+_PERIODS = {"daily": 1, "weekly": 5, "biweekly": 10, "monthly": 21}
+
+
+def to_period(
+    dates: List[str], frame: Dict[str, list], period: str = "weekly"
+) -> Tuple[List[str], Dict[str, list]]:
+    """Downsample a price frame by keeping the LAST observation in each bucket.
+
+    Why this exists: when two series are snapshotted at different moments within
+    a day (a futures settlement print vs an FX spot snapshot hours later), their
+    daily returns measure different windows of market time and the measured beta
+    is attenuated toward zero. Lengthening the return period makes a few hours of
+    offset negligible — over a week, a 4-hour offset is noise.
+
+    Buckets are ISO weeks for "weekly" so they align to real calendar weeks
+    regardless of holidays, rather than to a rolling count of rows that would
+    drift whenever an exchange closed.
+
+    Taking the LAST observation in each bucket (rather than the first, or a mean)
+    keeps every value a real traded price. Averaging would invent prices and
+    dampen volatility.
+    """
+    if period == "daily":
+        return list(dates), {k: list(v) for k, v in frame.items()}
+    if period not in _PERIODS:
+        raise ValueError(
+            f"unknown period {period!r}; choose from {sorted(_PERIODS)}"
+        )
+
+    def bucket(day: str) -> str:
+        d = _date.fromisoformat(day)
+        if period == "weekly":
+            iso = d.isocalendar()
+            return f"{iso[0]}-W{iso[1]:02d}"
+        if period == "monthly":
+            return f"{d.year}-{d.month:02d}"
+        # biweekly: pair up ISO weeks
+        iso = d.isocalendar()
+        return f"{iso[0]}-B{(iso[1] - 1) // 2:02d}"
+
+    # Last DATE present in each bucket, across the whole axis.
+    last_of: Dict[str, str] = {}
+    for day in dates:
+        try:
+            last_of[bucket(day)] = day
+        except ValueError:
+            continue
+
+    kept = sorted(last_of.values())
+    kept_index = {d: i for i, d in enumerate(dates)}
+
+    out: Dict[str, list] = {}
+    for name, column in frame.items():
+        new_col: list = []
+        for day in kept:
+            b = bucket(day)
+            # Walk backwards inside the bucket for the most recent real value, so
+            # a holiday on the bucket's last day does not blank the whole period.
+            value = None
+            i = kept_index[day]
+            while i >= 0 and bucket(dates[i]) == b:
+                if column[i] is not None:
+                    value = column[i]
+                    break
+                i -= 1
+            new_col.append(value)
+        out[name] = new_col
+
+    return kept, out

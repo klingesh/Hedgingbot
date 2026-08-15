@@ -130,8 +130,17 @@ class SeriesAlignment:
         return self.at_zero / float(self.observations)
 
     def verdict(self, min_gain: float, min_coverage: float) -> str:
-        if self.best_offset != 0 and self.gain >= min_gain:
-            return "MISALIGNED"
+        """MISALIGNED > SUSPECT > LOW COVERAGE > ok.
+
+        SUSPECT exists because of a real failure on live data: the Yahoo FX
+        series peaked at offset +1 with only a 4.3% overlap gain, which fell
+        under a 10% threshold, so the report concluded "all series agree". A
+        check that observes the anomaly and then declares everything fine is
+        worse than no check at all. ANY non-zero best offset is now surfaced;
+        only the severity is graded.
+        """
+        if self.best_offset != 0:
+            return "MISALIGNED" if self.gain >= min_gain else "SUSPECT"
         if self.coverage < min_coverage:
             return "LOW COVERAGE"
         return "ok"
@@ -145,17 +154,28 @@ class AlignmentReport:
     min_gain: float = 0.10
     min_coverage: float = 0.80
 
-    def misaligned(self) -> List[SeriesAlignment]:
+    def _with_verdict(self, want: str) -> List[SeriesAlignment]:
         return [s for s in self.series
-                if s.verdict(self.min_gain, self.min_coverage) == "MISALIGNED"]
+                if s.verdict(self.min_gain, self.min_coverage) == want]
+
+    def misaligned(self) -> List[SeriesAlignment]:
+        return self._with_verdict("MISALIGNED")
+
+    def suspect(self) -> List[SeriesAlignment]:
+        """Best offset is non-zero but the overlap gain is small.
+
+        Usually means the series is NOT simply shifted a whole day, but is
+        snapshotted at a different time WITHIN the day — which no label shift can
+        fix. Check synchronicity_profile() next.
+        """
+        return self._with_verdict("SUSPECT")
 
     def low_coverage(self) -> List[SeriesAlignment]:
-        return [s for s in self.series
-                if s.verdict(self.min_gain, self.min_coverage) == "LOW COVERAGE"]
+        return self._with_verdict("LOW COVERAGE")
 
     @property
     def healthy(self) -> bool:
-        return not self.misaligned() and not self.low_coverage()
+        return not (self.misaligned() or self.suspect() or self.low_coverage())
 
     def render(self) -> str:
         offsets = sorted(self.series[0].counts) if self.series else []
@@ -202,6 +222,29 @@ class AlignmentReport:
                 "   Any beta computed for these is NOT trustworthy: the regression is",
                 "   pairing one day's return against another day's factor. Expect",
                 "   spuriously LOW R^2 and betas biased toward zero.",
+            ]
+
+        maybe = self.suspect()
+        if maybe:
+            lines += [
+                "",
+                "   SUSPECT — best offset is non-zero but the gain is small:",
+                "",
+            ]
+            for s in maybe:
+                lines.append(
+                    f"     {s.name:<12} offset {s.best_offset:+d} raises overlap "
+                    f"{s.at_zero} -> {s.best_count} ({s.gain * 100:+.1f}%)"
+                )
+            lines += [
+                "",
+                "   A small gain means these are probably NOT shifted a whole day.",
+                "   The more likely cause is a different SNAPSHOT TIME within the day",
+                "   (e.g. a futures settlement print vs an FX spot snapshot hours",
+                "   later). No label shift can fix that, and it ATTENUATES betas",
+                "   toward zero while leaving row counts and date coverage healthy.",
+                "",
+                "   Check the synchronicity report below before trusting these betas.",
             ]
 
         weak = self.low_coverage()
@@ -295,3 +338,196 @@ def find_circular_instruments(
         for inst, sym in instrument_symbols.items()
         if sym in by_symbol
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Synchronicity: are two series snapshotted at the same MOMENT?
+# ---------------------------------------------------------------------------
+#
+# Date alignment asks "are these filed under the same day?". Synchronicity asks
+# the harder question: "were they PRICED at the same moment?"
+#
+# The live run showed EURUSD with a 0.28 R^2 against the dollar factor. EURUSD is
+# ~58% of DXY by weight, so its true daily correlation with the dollar is around
+# -0.95, implying R^2 ~ 0.9. And the date-alignment check found only a 4.3%
+# overlap gain from shifting, far too small for a whole-day shift to explain a
+# collapse that severe.
+#
+# The remaining explanation is intraday: `DX-Y.NYB` is an index print on a US
+# futures settlement clock, while `EURUSD=X` is a spot snapshot taken hours later.
+# Both land on the same calendar date, so every date check passes, but they
+# measure different windows of market time. Correlation is then split ACROSS
+# adjacent days instead of concentrated on the same day.
+#
+# That is exactly what this measures. For non-synchronous series, |corr| at lag
+# +/-1 is non-trivial and the sum across lags greatly exceeds the lag-0 value.
+# The standard remedies are (a) longer return periods, where a few hours of
+# offset stops mattering, and (b) summing the lagged betas -- the Dimson
+# aggregated-coefficient correction.
+
+
+@dataclass
+class Synchronicity:
+    name: str
+    factor: str
+    correlations: Dict[int, float] = field(default_factory=dict)
+    betas: Dict[int, float] = field(default_factory=dict)
+    n_obs: int = 0
+
+    @property
+    def contemporaneous(self) -> float:
+        return self.correlations.get(0, 0.0)
+
+    @property
+    def best_lag(self) -> int:
+        if not self.correlations:
+            return 0
+        return max(sorted(self.correlations, key=lambda k: (abs(k), k)),
+                   key=lambda k: abs(self.correlations[k]))
+
+    @property
+    def leakage(self) -> float:
+        """Share of total absolute correlation sitting at NON-zero lags.
+
+        ~0 for synchronous data. Large means the relationship is smeared across
+        adjacent days, i.e. the two series are priced at different moments.
+        """
+        total = sum(abs(v) for v in self.correlations.values())
+        if total <= 1e-12:
+            return 0.0
+        return (total - abs(self.contemporaneous)) / total
+
+    @property
+    def dimson_beta(self) -> float:
+        """Sum of betas across all lags — the Dimson aggregated coefficient.
+
+        For non-synchronous data this recovers the economic sensitivity that the
+        lag-0 beta alone understates.
+        """
+        return sum(self.betas.values())
+
+    def verdict(self, max_leakage: float = 0.45) -> str:
+        if self.best_lag != 0 and abs(self.correlations.get(self.best_lag, 0.0)) > \
+                abs(self.contemporaneous) * 1.15:
+            return "ASYNCHRONOUS"
+        if self.leakage > max_leakage:
+            return "SMEARED"
+        return "ok"
+
+
+def synchronicity_profile(
+    instrument_returns: List[float],
+    factor_returns: List[float],
+    max_lag: int = 2,
+    name: str = "",
+    factor: str = "",
+) -> Synchronicity:
+    """Correlation and beta of an instrument against a factor at several lags.
+
+    Both lists must be aligned and the same length, with no None values.
+
+    A POSITIVE lag means the FACTOR is shifted forward in time, i.e. lag +1
+    correlates the instrument today against the factor yesterday.
+    """
+    from ..factors.math_core import normalized_weights, wcorr, wcov, wvar
+
+    if len(instrument_returns) != len(factor_returns):
+        raise ValueError(
+            f"length mismatch: instrument {len(instrument_returns)}, "
+            f"factor {len(factor_returns)}"
+        )
+
+    out = Synchronicity(name=name, factor=factor, n_obs=len(instrument_returns))
+
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            y = instrument_returns[lag:]
+            x = factor_returns[:-lag] if lag else factor_returns
+        elif lag < 0:
+            y = instrument_returns[:lag]
+            x = factor_returns[-lag:]
+        else:
+            y = list(instrument_returns)
+            x = list(factor_returns)
+
+        if len(y) < 30 or len(y) != len(x):
+            out.correlations[lag] = 0.0
+            out.betas[lag] = 0.0
+            continue
+
+        w = normalized_weights(len(y), None)
+        out.correlations[lag] = wcorr(y, x, w)
+        vx = wvar(x, w)
+        out.betas[lag] = (wcov(y, x, w) / vx) if vx > 1e-18 else 0.0
+
+    return out
+
+
+def render_synchronicity(
+    profiles: List[Synchronicity], max_leakage: float = 0.45
+) -> str:
+    """Table of lagged correlations, one row per instrument."""
+    if not profiles:
+        return "   (nothing to check)"
+
+    lags = sorted(profiles[0].correlations)
+    lines = [
+        f"   Correlation with the {profiles[0].factor} factor at several lags.",
+        "   Synchronous data concentrates correlation at lag 0. Correlation",
+        "   leaking to +/-1 means the two series are priced at different moments,",
+        "   which ATTENUATES the lag-0 beta toward zero.",
+        "",
+        "   " + f"{'instrument':<14}"
+        + "".join(f"{('lag ' + str(l)):>9}" for l in lags)
+        + f"{'leak':>7}{'beta0':>8}{'dimson':>8}{'verdict':>15}",
+    ]
+    lines.append("   " + "-" * (len(lines[-1]) - 3))
+
+    for p in sorted(profiles, key=lambda q: q.name):
+        row = f"   {p.name:<14}"
+        for l in lags:
+            mark = "*" if l == p.best_lag else " "
+            row += f"{p.correlations.get(l, 0.0):>8.2f}{mark}"
+        row += f"{p.leakage * 100:>6.0f}%"
+        row += f"{p.betas.get(0, 0.0):>8.2f}"
+        row += f"{p.dimson_beta:>8.2f}"
+        row += f"{p.verdict(max_leakage):>15}"
+        lines.append(row)
+
+    lines += ["", "   * = lag with the strongest |correlation|",
+              "   beta0  = beta at lag 0 (what the model currently uses)",
+              "   dimson = sum of betas across all lags (the Dimson correction,",
+              "            which is the economically meaningful sensitivity when",
+              "            the series are not synchronous)"]
+
+    bad = [p for p in profiles if p.verdict(max_leakage) != "ok"]
+    if bad:
+        lines += [
+            "",
+            "   *** NON-SYNCHRONOUS DATA ***",
+            "",
+        ]
+        for p in bad:
+            lines.append(
+                f"     {p.name:<12} {p.verdict(max_leakage):<13} "
+                f"beta0 {p.betas.get(0, 0.0):+.2f} vs dimson "
+                f"{p.dimson_beta:+.2f}  (leak {p.leakage * 100:.0f}%)"
+            )
+        lines += [
+            "",
+            "   These betas are ATTENUATED: the true sensitivity is closer to the",
+            "   dimson column. Sizing a hedge from beta0 would UNDER-hedge.",
+            "",
+            "   Fix by lengthening the return period so a few hours of offset stops",
+            "   mattering:",
+            "       python scripts/estimate_betas.py --return-period weekly",
+            "",
+            "   A weekly period trades sample size for accuracy (about 1/5 the",
+            "   observations), which is the right trade when the daily numbers are",
+            "   biased rather than merely noisy.",
+        ]
+    else:
+        lines += ["", "   All series look synchronous with the factor."]
+
+    return "\n".join(lines)

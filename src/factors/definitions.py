@@ -87,12 +87,17 @@ USD_SYNTHETIC_BASKET: dict[str, tuple[int, float]] = {
 # repos never disagree about what "GOLD" means.
 # ---------------------------------------------------------------------------
 
+#: Broker symbols here are the JustMarkets ECN names CONFIRMED against a live
+#: account (login 1100219238, JustMarkets-Demo2) with scripts/check_account_mode.py.
+#: Note NGAS/UKOIL/USOIL do NOT exist there — the real names are XNGUSD, BRENT and
+#: WTI. Always confirm against your own account; symbol naming is broker-specific
+#: and even varies between account types at the same broker.
 TRADINGBOT_PORTFOLIO: dict[str, tuple[str, str, str]] = {
     "GOLD":     ("GC=F",     "XAUUSD", "commodity"),
     "SILVER":   ("SI=F",     "XAGUSD", "commodity"),
     "PLATINUM": ("PL=F",     "XPTUSD", "commodity"),
-    "NATGAS":   ("NG=F",     "NGAS",   "commodity"),
-    "BRENT":    ("BZ=F",     "UKOIL",  "commodity"),
+    "NATGAS":   ("NG=F",     "XNGUSD", "commodity"),
+    "BRENT":    ("BZ=F",     "BRENT",  "commodity"),
     "GBPJPY":   ("GBPJPY=X", "GBPJPY", "forex"),
     "AUDUSD":   ("AUDUSD=X", "AUDUSD", "forex"),
     "USDJPY":   ("USDJPY=X", "USDJPY", "forex"),
@@ -112,18 +117,24 @@ TRADINGBOT_PORTFOLIO: dict[str, tuple[str, str, str]] = {
 # ---------------------------------------------------------------------------
 
 #: logical -> (yahoo symbol, broker symbol, preferred_for factor or None)
+#:
+#: IMPORTANT: the KEYS here are the logical names the BetaBook is indexed by, so
+#: `hedge_instruments` in your config must use these exact keys. Using broker-ish
+#: keys (US500 instead of SP500, USOIL instead of WTI) makes every candidate
+#: invisible to the beta lookup, and the overlay then reports "no usable hedge
+#: instrument" for a factor it could actually hedge perfectly well.
 HEDGE_CANDIDATES: dict[str, tuple[str, str, str | None]] = {
     # Cleanest single-factor USD expression available as a retail CFD.
     "EURUSD": ("EURUSD=X", "EURUSD", USD),
     # Backup / cross-check USD leg.
     "USDCHF": ("USDCHF=X", "USDCHF", USD),
-    # Equity index for RISK. US500 is the tightest-spread index CFD at most brokers.
+    # Equity index for RISK. Tightest-spread index CFD at most brokers.
     "SP500":  ("ES=F",     "US500",  RISK),
-    # WTI for ENERGY (BRENT is already a book position, so hedging with WTI
-    # avoids netting against the trader's own leg on the same symbol).
-    "WTI":    ("CL=F",     "USOIL",  ENERGY),
-    # Silver is the liquid metals leg that is NOT gold, so it can offset a
-    # METALS breach without colliding with the GOLD slot.
+    # WTI for ENERGY. BRENT is already a book position, so hedging with WTI keeps
+    # the hedge off a symbol the trader holds.
+    "WTI":    ("CL=F",     "WTI",    ENERGY),
+    # Silver is the liquid metals leg that is NOT gold, so it can offset a METALS
+    # breach without colliding with the GOLD slot.
     "SILVER": ("SI=F",     "XAGUSD", METALS),
 }
 

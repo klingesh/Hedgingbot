@@ -33,7 +33,11 @@ from src.data.diagnostics import (                                       # noqa:
     diagnose_alignment,
     find_circular_instruments,
 )
-from src.data.yahoo import align_price_frame                            # noqa: E402
+from src.data.diagnostics import (                                       # noqa: E402
+    render_synchronicity,
+    synchronicity_profile,
+)
+from src.data.yahoo import align_price_frame, to_period                  # noqa: E402
 from src.factors.definitions import (                                    # noqa: E402
     FACTOR_PROXIES,
     FACTORS,
@@ -259,11 +263,30 @@ def hedge_purity_table(book, candidates: list[str]) -> None:
             row += f"{book.beta(c, f):>11.2f}/{book.purity(c, f):<7.2f}"
         print(row)
 
-    print("\n   Best available lever per factor (score = purity^2 * |beta|):")
+    # Apply the SAME thresholds the overlay enforces (HedgeCaps defaults).
+    # Without them this table happily reported "RISK -> EURUSD beta +0.01,
+    # purity 0.00" as the best lever — technically the highest score, but an
+    # instrument the overlay would reject outright. A report that disagrees with
+    # the thing it is reporting on is worse than no report.
+    from src.overlay.decision import HedgeCaps
+
+    defaults = HedgeCaps(factor_caps={"USD": 1.0})
+    min_p, min_b = defaults.min_purity, defaults.min_abs_beta
+
+    print(f"\n   Best available lever per factor (score = purity^2 * |beta|),")
+    print(f"   applying the overlay's own thresholds: purity >= {min_p}, "
+          f"|beta| >= {min_b}")
     for f in FACTORS:
-        best = book.best_hedge_for(f, candidates)
+        best = book.best_hedge_for(f, candidates, min_purity=min_p,
+                                   min_abs_beta=min_b)
         if best is None:
-            print(f"     {f:<8} -> NO USABLE CANDIDATE")
+            near = book.best_hedge_for(f, candidates)
+            extra = ""
+            if near:
+                extra = (f"  (closest was {near}: beta "
+                         f"{book.beta(near, f):+.2f}, purity "
+                         f"{book.purity(near, f):.2f} — rejected)")
+            print(f"     {f:<8} -> NO USABLE CANDIDATE{extra}")
             continue
         print(f"     {f:<8} -> {best:<10} beta {book.beta(best, f):+.2f}, "
               f"purity {book.purity(best, f):.2f}")
@@ -300,6 +323,11 @@ def main() -> int:
     ap.add_argument("--ignore-misalignment", action="store_true",
                     help="write betas even from misaligned data. Do not use this "
                          "unless you know exactly why.")
+    ap.add_argument("--return-period", default="daily",
+                    choices=("daily", "weekly", "biweekly", "monthly"),
+                    help="return horizon for beta estimation. Use weekly when the "
+                         "synchronicity report says the series are priced at "
+                         "different moments within the day (default: daily)")
     args = ap.parse_args()
 
     halflife = args.halflife if args.halflife and args.halflife > 0 else None
@@ -415,6 +443,19 @@ def main() -> int:
 
     instrument_prices = {k: v for k, v in frame.items() if not k.startswith("__factor_")}
 
+    # ---- optional return-period resampling -------------------------------
+    if args.return_period != "daily":
+        merged = dict(factor_prices)
+        merged.update(instrument_prices)
+        dates, merged = to_period(dates, merged, args.return_period)
+        factor_prices = {k: merged[k] for k in factor_prices}
+        instrument_prices = {k: merged[k] for k in instrument_prices}
+        print(f"\n  Resampled to {args.return_period}: {len(dates)} periods "
+              f"({dates[0]} -> {dates[-1]})")
+        print("  Longer periods make an intraday snapshot-time offset negligible,")
+        print("  at the cost of sample size. Use this when the daily betas are")
+        print("  BIASED (see the synchronicity report), not merely noisy.")
+
     # ---- returns ---------------------------------------------------------
     proxy_rets = returns_from_prices(factor_prices, args.winsorize)
     inst_rets = returns_from_prices(instrument_prices, args.winsorize)
@@ -461,6 +502,35 @@ def main() -> int:
     print("   mostly explained by the ones before it — precisely the double-")
     print("   counting an unorthogonalized model would have hidden.")
 
+    # ---- synchronicity ---------------------------------------------------
+    # Runs against the FIRST factor, which is both the reference calendar and
+    # where the live anomaly appeared. Date alignment can pass while this fails:
+    # same day, different moment.
+    _hr("2b. SYNCHRONICITY CHECK")
+    ref_factor = factors.names[0]
+    profiles = []
+    fser = factors.series[ref_factor]
+    for name in sorted(inst_rets):
+        series = inst_rets[name]
+        y: list = []
+        x: list = []
+        for pos, row in enumerate(kept):
+            if row >= len(series):
+                continue
+            v = series[row]
+            if v is None or not math.isfinite(v):
+                continue
+            y.append(float(v))
+            x.append(fser[pos])
+        if len(y) < 100:
+            continue
+        profiles.append(synchronicity_profile(y, x, 2, name, ref_factor))
+    print(render_synchronicity(profiles))
+    if args.return_period == "daily":
+        print("\n   Caveat: lags here are counted in SURVIVING observations, not")
+        print("   calendar days, so for a series with gaps a 'lag 1' may span more")
+        print("   than one day. It is a strong signal, not a precise measurement.")
+
     # ---- betas -----------------------------------------------------------
     try:
         book, skipped = estimate_betas(inst_rets, factors, kept, halflife, args.min_obs)
@@ -494,6 +564,7 @@ def main() -> int:
         "halflife_days": halflife,
         "winsorize": args.winsorize,
         "min_obs": args.min_obs,
+        "return_period": args.return_period,
         "n_factor_obs": factors.n_obs,
         "date_range": [dates[0], dates[-1]],
         "orthogonalization_order": list(ORTHOGONALIZATION_ORDER),

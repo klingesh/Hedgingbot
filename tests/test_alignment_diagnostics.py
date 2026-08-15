@@ -288,3 +288,267 @@ def test_shipped_definitions_are_checked_for_circularity():
         f"shipped circularity changed: {circular}. If proxies moved to baskets "
         "this should now be empty — update the assertion deliberately."
     )
+
+
+
+# ---------------------------------------------------------------------------
+# SUSPECT: the case the first version silently passed
+# ---------------------------------------------------------------------------
+
+
+def test_small_gain_nonzero_offset_is_suspect_not_ok():
+    """The exact live numbers that were wrongly reported as "ok".
+
+    Yahoo FX peaked at offset +1 with 1853 vs 1777 shared dates — a 4.3% gain,
+    under the 10% MISALIGNED threshold. The first version therefore printed
+    "All series agree with the reference calendar", which is the worst possible
+    outcome: a check that sees the anomaly and declares everything fine.
+    """
+    s = SeriesAlignment(
+        name="EURUSD", observations=2083,
+        counts={-2: 1189, -1: 1364, 0: 1778, 1: 1853, 2: 1458},
+    )
+
+    assert s.best_offset == 1
+    assert s.gain == pytest.approx((1853 - 1778) / 1778, rel=1e-6)
+    assert s.gain < 0.10, "this is the sub-threshold case, by construction"
+    assert s.verdict(0.10, 0.80) == "SUSPECT", (
+        "a non-zero best offset must never be reported as 'ok'"
+    )
+
+    report = AlignmentReport(reference="__factor_USD", reference_days=2012,
+                             series=[s])
+    assert not report.healthy
+    assert report.suspect() == [s]
+    assert report.misaligned() == [], "a 4.3% gain is not a whole-day shift"
+
+    text = report.render()
+    assert "SUSPECT" in text
+    assert "SNAPSHOT TIME" in text, "must point at the real likely cause"
+    assert "All series agree" not in text, (
+        "the misleading all-clear must not appear alongside a SUSPECT series"
+    )
+
+
+def test_suspect_does_not_escalate_to_misaligned():
+    """SUSPECT warns; it must not stop the study, because a label shift is not
+    the fix for an intraday timing offset."""
+    s = SeriesAlignment(name="fx", observations=100,
+                        counts={-1: 40, 0: 80, 1: 84})
+    assert s.verdict(0.10, 0.80) == "SUSPECT"
+    assert s.verdict(0.01, 0.80) == "MISALIGNED", (
+        "a lower threshold should escalate the same data"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Synchronicity
+# ---------------------------------------------------------------------------
+
+
+def test_synchronous_data_concentrates_correlation_at_lag_zero():
+    from src.data.diagnostics import synchronicity_profile
+
+    rng = LCG(51)
+    f = rng.normals(1500, 0.0, 0.01)
+    inst = [0.8 * v + rng.normal(0.0, 0.002) for v in f]
+
+    p = synchronicity_profile(inst, f, max_lag=2, name="clean", factor="USD")
+
+    assert p.best_lag == 0
+    assert p.correlations[0] > 0.9
+    assert abs(p.correlations[1]) < 0.2
+    assert abs(p.correlations[-1]) < 0.2
+    assert p.leakage < 0.35
+    assert p.verdict() == "ok"
+    assert p.betas[0] == pytest.approx(0.8, abs=0.03)
+    assert p.dimson_beta == pytest.approx(0.8, abs=0.1)
+
+
+def test_asynchronous_data_smears_correlation_and_attenuates_beta():
+    """An instrument that absorbs half of today's factor move and half of
+    yesterday's — the signature of a different snapshot time."""
+    from src.data.diagnostics import synchronicity_profile
+
+    rng = LCG(52)
+    f = rng.normals(3000, 0.0, 0.01)
+    true_beta = 1.0
+    inst = [true_beta * (0.5 * f[i] + 0.5 * f[i - 1]) if i else true_beta * f[i]
+            for i in range(len(f))]
+
+    p = synchronicity_profile(inst, f, max_lag=2, name="fx", factor="USD")
+
+    # The lag-0 beta is roughly HALF the truth: that is the attenuation.
+    assert p.betas[0] == pytest.approx(0.5, abs=0.08)
+    # Dimson recovers it.
+    assert p.dimson_beta == pytest.approx(true_beta, abs=0.12)
+    assert p.leakage > 0.30
+    assert p.verdict(max_leakage=0.30) != "ok"
+
+
+def test_synchronicity_rejects_length_mismatch():
+    from src.data.diagnostics import synchronicity_profile
+
+    with pytest.raises(ValueError, match="length mismatch"):
+        synchronicity_profile([0.1] * 10, [0.1] * 9)
+
+
+def test_render_synchronicity_flags_and_advises():
+    from src.data.diagnostics import render_synchronicity, synchronicity_profile
+
+    rng = LCG(53)
+    f = rng.normals(2000, 0.0, 0.01)
+    inst = [0.5 * f[i] + 0.5 * f[i - 1] if i else f[i] for i in range(len(f))]
+
+    text = render_synchronicity(
+        [synchronicity_profile(inst, f, 2, "fx", "USD")], max_leakage=0.30
+    )
+
+    assert "NON-SYNCHRONOUS DATA" in text
+    assert "--return-period weekly" in text
+    assert "dimson" in text
+    assert "UNDER-hedge" in text
+
+
+def test_render_synchronicity_all_clear():
+    from src.data.diagnostics import render_synchronicity, synchronicity_profile
+
+    rng = LCG(54)
+    f = rng.normals(1500, 0.0, 0.01)
+    inst = [0.9 * v + rng.normal(0.0, 0.001) for v in f]
+
+    text = render_synchronicity([synchronicity_profile(inst, f, 2, "x", "USD")])
+    assert "look synchronous" in text
+    assert "NON-SYNCHRONOUS" not in text
+
+
+# ---------------------------------------------------------------------------
+# Return-period resampling
+# ---------------------------------------------------------------------------
+
+
+def test_to_period_daily_is_identity():
+    from src.data.yahoo import to_period
+
+    dates = business_days("2020-01-01", 10)
+    frame = {"a": [float(i) for i in range(10)]}
+    kept, out = to_period(dates, frame, "daily")
+    assert kept == dates
+    assert out["a"] == frame["a"]
+
+
+def test_to_period_weekly_keeps_the_last_observation_per_iso_week():
+    from src.data.yahoo import to_period
+
+    # 2020-01-01 is a Wednesday. Week 1: Wed-Fri. Week 2: Mon-Fri.
+    dates = business_days("2020-01-01", 8)
+    frame = {"a": [float(i) for i in range(8)]}
+
+    kept, out = to_period(dates, frame, "weekly")
+
+    assert kept == ["2020-01-03", "2020-01-10"]
+    assert out["a"] == [2.0, 7.0], "must take the LAST value in each week"
+
+
+def test_to_period_walks_back_over_a_holiday_at_the_week_end():
+    """If the bucket's final day is missing for one series, use the most recent
+    real value INSIDE that bucket rather than blanking the whole period."""
+    from src.data.yahoo import to_period
+
+    dates = business_days("2020-01-06", 5)          # Mon..Fri, one ISO week
+    frame = {"a": [1.0, 2.0, 3.0, 4.0, None]}       # Friday holiday for `a`
+
+    kept, out = to_period(dates, frame, "weekly")
+
+    assert kept == ["2020-01-10"]
+    assert out["a"] == [4.0], "should fall back to Thursday, not None"
+
+
+def test_to_period_blanks_a_bucket_with_no_data_at_all():
+    from src.data.yahoo import to_period
+
+    dates = business_days("2020-01-06", 5)
+    frame = {"a": [None] * 5}
+    kept, out = to_period(dates, frame, "weekly")
+    assert out["a"] == [None]
+
+
+def test_to_period_reduces_sample_size_about_fivefold():
+    from src.data.yahoo import to_period
+
+    dates = business_days("2020-01-01", 500)
+    frame = {"a": [float(i) for i in range(500)]}
+    kept, _out = to_period(dates, frame, "weekly")
+    assert 90 < len(kept) < 110, f"500 weekdays should give ~100 weeks, got {len(kept)}"
+
+
+def test_to_period_monthly_and_biweekly_are_available():
+    from src.data.yahoo import to_period
+
+    dates = business_days("2020-01-01", 250)
+    frame = {"a": [float(i) for i in range(250)]}
+
+    weekly, _ = to_period(dates, frame, "weekly")
+    biweekly, _ = to_period(dates, frame, "biweekly")
+    monthly, _ = to_period(dates, frame, "monthly")
+
+    assert len(weekly) > len(biweekly) > len(monthly)
+
+
+def test_to_period_rejects_unknown_period():
+    from src.data.yahoo import to_period
+
+    with pytest.raises(ValueError, match="unknown period"):
+        to_period(["2020-01-01"], {"a": [1.0]}, "fortnightly")
+
+
+def test_weekly_resampling_repairs_an_asynchronous_beta():
+    """The end-to-end justification for --return-period weekly.
+
+    An instrument split half across today and yesterday has its DAILY beta
+    attenuated to about half the truth. On weekly returns, a one-day smear is a
+    small fraction of the period, so the beta should come much closer to the
+    real value.
+    """
+    from src.data.yahoo import to_period
+    from src.factors.estimate import build_factors, estimate_betas, returns_from_prices
+
+    n = 2600
+    rng = LCG(2025)
+    true_beta = 1.0
+
+    factor_rets = {f: rng.normals(n, 0.0, 0.01) for f in FACTOR_ORDER}
+    usd = factor_rets["USD"]
+    inst_rets = [true_beta * (0.5 * usd[i] + 0.5 * usd[i - 1]) if i
+                 else true_beta * usd[i] for i in range(n)]
+
+    def to_prices(rets):
+        px = [100.0]
+        for r in rets:
+            px.append(px[-1] * (1.0 + r))
+        return px
+
+    dates = business_days("2016-01-04", n + 1)
+    frame = {f"__factor_{f}": to_prices(r) for f, r in factor_rets.items()}
+    frame["FXLIKE"] = to_prices(inst_rets)
+
+    def beta_at(period: str) -> float:
+        d, fr = to_period(dates, frame, period)
+        proxies = returns_from_prices(
+            {f: fr[f"__factor_{f}"] for f in FACTOR_ORDER}, 0.0)
+        factors, kept = build_factors(proxies, FACTOR_ORDER, None)
+        book, _sk = estimate_betas(
+            returns_from_prices({"FXLIKE": fr["FXLIKE"]}, 0.0),
+            factors, kept, None, min_obs=50)
+        return book.beta("FXLIKE", "USD")
+
+    daily = beta_at("daily")
+    weekly = beta_at("weekly")
+
+    assert daily == pytest.approx(0.5, abs=0.12), (
+        f"daily beta should be attenuated to ~half, got {daily:.2f}"
+    )
+    assert weekly > daily, "weekly must recover some of the attenuation"
+    assert weekly == pytest.approx(true_beta, abs=0.25), (
+        f"weekly beta should approach the true {true_beta}, got {weekly:.2f}"
+    )

@@ -375,12 +375,20 @@ def check_betas(c: Checks, cfg: dict, reader) -> None:
 
     missing = sorted(n for n in logical_names if not book.has(n))
     if missing:
-        c.add(WARN, f"No betas for configured logical name(s): {', '.join(missing)}",
-              "Any OPEN position on these blocks hedging entirely (by design — "
-              "the overlay refuses to hedge a book it cannot fully see).\n"
-              "Either add them to TRADINGBOT_PORTFOLIO / HEDGE_CANDIDATES in "
-              "src/factors/definitions.py and re-run the study, or remove them "
-              "from the config.")
+        known = ", ".join(book.instruments())
+        c.add(FAIL,
+              f"No betas for configured logical name(s): {', '.join(missing)}",
+              "MOST LIKELY CAUSE: the config KEY does not match the logical name "
+              "the betas are indexed by. The key is not cosmetic — it is the "
+              "lookup key.\n"
+              f"  Names that DO have betas: {known}\n"
+              "  Common mistakes: US500 should be SP500, USOIL should be WTI, "
+              "XAGUSD should be SILVER.\n"
+              "  In config, key = logical name, value = your broker symbol:\n"
+              "      SP500: US500.ecn\n"
+              "A mismatch here silently makes the candidate invisible, and the "
+              "overlay then reports 'no usable hedge instrument' for a factor it "
+              "could hedge perfectly well.")
     elif logical_names:
         c.add(PASS, f"All {len(logical_names)} configured names have betas")
 

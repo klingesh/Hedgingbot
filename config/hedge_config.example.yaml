@@ -79,24 +79,36 @@ betas:
   min_obs: 250
 
 # ---------------------------------------------------------------------------
-# Hedge instruments. Broker symbols must match YOUR broker exactly — discover
-# them with Tradingbot's scripts/check_mt5.py or scripts/check_account_mode.py.
+# Hedge instruments.
+#
+# THE KEY IS NOT COSMETIC. Keys must exactly match the logical names in
+# HEDGE_CANDIDATES / TRADINGBOT_PORTFOLIO in src/factors/definitions.py, because
+# that is how betas are looked up. Writing `US500:` instead of `SP500:` makes the
+# candidate invisible to the beta book, and the overlay then reports
+# "NO usable hedge instrument" for RISK even though US500 would hedge it fine.
+#
+#   key   = logical name (must match definitions.py)
+#   value = YOUR broker's symbol (confirm with check_account_mode.py)
+#
+# Values below are JustMarkets ECN names confirmed against a live demo account.
 # ---------------------------------------------------------------------------
 hedge_instruments:
-  EURUSD: EURUSD.ecn
-  US500: US500.ecn
-  USOIL: USOIL.ecn
-  XAGUSD: XAGUSD.ecn
+  EURUSD: EURUSD.ecn      # USD lever   — beta -0.56, purity 0.96 (measured)
+  SP500: US500.ecn        # RISK lever  — beta +0.98, purity 0.97
+  WTI: WTI.ecn            # ENERGY lever— beta +0.99, purity 0.98
+  SILVER: XAGUSD.ecn      # METALS lever— beta +1.48, purity 0.78
 
-# The trader's own symbols. The overlay will NOT trade these, because on a
-# NETTING account an opposing order on the same symbol reduces the trader's
-# position instead of hedging it.
+# The trader's own symbols. The overlay will NOT trade these. Same key rule
+# applies.
+#
+# NOTE: JustMarkets does NOT use NGAS / UKOIL / USOIL. The real names are
+# XNGUSD, BRENT and WTI. Confirm yours rather than copying these.
 trader_symbols:
   GOLD: XAUUSD.ecn
   SILVER: XAGUSD.ecn
   PLATINUM: XPTUSD.ecn
-  NATGAS: NGAS.ecn
-  BRENT: UKOIL.ecn
+  NATGAS: XNGUSD.ecn
+  BRENT: BRENT.ecn
   GBPJPY: GBPJPY.ecn
   AUDUSD: AUDUSD.ecn
   USDJPY: USDJPY.ecn

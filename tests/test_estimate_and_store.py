@@ -335,3 +335,40 @@ def test_save_is_atomic_leaving_no_temp_files(tmp_path):
 
     leftovers = [f for f in os.listdir(str(tmp_path)) if f.startswith(".tmp")]
     assert leftovers == [], f"atomic write left temp files behind: {leftovers}"
+
+
+
+# ---------------------------------------------------------------------------
+# best_hedge_for must not recommend a lever the overlay would reject
+# ---------------------------------------------------------------------------
+
+
+def test_best_hedge_for_rejects_a_near_zero_lever_when_thresholds_are_given():
+    """A tiny-but-nonzero purity beat a starting score of 0.0 and got reported as
+    the best lever ("RISK -> EURUSD beta +0.01, purity 0.00"). With the overlay's
+    real thresholds applied it must come back None instead."""
+    book = BetaBook(
+        factors=FACTORS,
+        betas={"EURUSD": {"USD": -0.90, "RISK": 0.01,
+                          "ENERGY": -0.02, "METALS": 0.001}},
+        sigma={"EURUSD": 0.005}, resid_sigma={"EURUSD": 0.001},
+        factor_sigma={"USD": 0.004, "RISK": 0.011, "ENERGY": 0.022,
+                      "METALS": 0.009},
+    )
+
+    # Unfiltered, it picks the only candidate for every factor.
+    assert book.best_hedge_for("RISK", ["EURUSD"]) == "EURUSD"
+
+    # With the overlay's thresholds it correctly refuses.
+    from src.overlay.decision import HedgeCaps
+    d = HedgeCaps(factor_caps={"USD": 1.0})
+    assert book.best_hedge_for("RISK", ["EURUSD"],
+                               min_purity=d.min_purity,
+                               min_abs_beta=d.min_abs_beta) is None
+    assert book.best_hedge_for("METALS", ["EURUSD"],
+                               min_purity=d.min_purity,
+                               min_abs_beta=d.min_abs_beta) is None
+    # But USD is a genuine lever and must survive.
+    assert book.best_hedge_for("USD", ["EURUSD"],
+                               min_purity=d.min_purity,
+                               min_abs_beta=d.min_abs_beta) == "EURUSD"
