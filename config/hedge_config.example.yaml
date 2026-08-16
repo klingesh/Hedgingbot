@@ -61,6 +61,17 @@ limits:
   min_abs_beta: 0.20           # ...and at least this sensitive to the factor
   max_actions_per_cycle: 1     # one change per cycle, then let it settle
   max_hedges_per_day: 6        # hard brake on churn; overlay stops acting after this
+  # A hedge must remove at least this fraction of the EXCESS leverage, or the
+  # overlay refuses and tells you to reduce the position instead.
+  #
+  # This exists because of a real measurement: a 1-lot short gold position on a
+  # 10.5k account produced USD leverage of +43x against a 1.50x cap. The largest
+  # hedge the gross ceiling allowed (0.90 lots EURUSD) reached +33.7x — removing
+  # 22% of the excess, leaving the book 22x over cap, and costing ~3.4% of equity
+  # per month in swap. A token hedge is worse than none: it bills you monthly for
+  # the impression that the risk was handled. An overlay cannot fix position
+  # sizing and should say so rather than pretend.
+  min_excess_removed: 0.50
   allow_unmapped: false        # false => refuse to hedge if any open symbol
                                # has no betas. Keep it false.
 

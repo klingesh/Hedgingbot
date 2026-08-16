@@ -34,6 +34,13 @@ that, and they ARE the product:
    trade more than a handful of times a day, the caps are wrong — and the budget
    makes that visible instead of expensive.
 
+7. FUTILITY CHECK. If the largest hedge available cannot remove a meaningful share
+   of the excess leverage, do nothing and say the position is too big. Found on a
+   real account: a 43x USD breach where the best possible hedge reached 33.7x,
+   removing 22% of the excess, costing ~3.4% of equity per month, and leaving the
+   book 22x over cap. A token hedge is worse than none, because it bills you
+   monthly for the impression that the risk was handled.
+
 One design decision worth defending
 -----------------------------------
 A drawdown kill switch (`halt_new` in Tradingbot) does NOT block hedging.
@@ -80,6 +87,9 @@ class HedgeCaps:
     max_actions_per_cycle: int = 1      # one change per cycle, then let it settle
     max_hedges_per_day: int = 6         # hard brake on churn
     allow_unmapped: bool = False        # refuse to act on an incomplete book
+    # A hedge must remove at least this fraction of the EXCESS leverage to be
+    # worth placing. See the futility check in hedge_decide() for why.
+    min_excess_removed: float = 0.50
 
     def __post_init__(self) -> None:
         if not self.factor_caps:
@@ -102,6 +112,8 @@ class HedgeCaps:
             )
         if self.max_actions_per_cycle < 1:
             raise ValueError("max_actions_per_cycle must be >= 1")
+        if not 0.0 <= self.min_excess_removed <= 1.0:
+            raise ValueError("min_excess_removed must be in [0, 1]")
 
     def cap(self, factor: str) -> float:
         v = self.factor_caps.get(factor)
@@ -546,6 +558,46 @@ def hedge_decide(
             continue
 
         after = _simulate_leverage(report, betas, side * lots * per_lot, key)
+
+        # ---- FUTILITY CHECK ------------------------------------------------
+        # Found by running against a real account. A 1-lot short gold position on
+        # a 10.5k account produced USD leverage of +43.07x against a 1.50x cap.
+        # The gross-notional ceiling limited the hedge to 0.90 lots of EURUSD,
+        # which moved leverage to +33.72x — removing 22% of the excess while
+        # leaving the book 22x over its cap, and costing ~3.4% of equity a month
+        # in swap plus the spread.
+        #
+        # That is not risk management. It is paying a recurring fee for a
+        # cosmetic improvement, and worse, it creates the impression the risk has
+        # been dealt with. When a breach is this far beyond what a hedge can
+        # reach, the honest answer is that the POSITION is too big — and the
+        # overlay cannot fix position sizing, so it must say so and stop.
+        excess_before = abs(lev) - c
+        excess_after = abs(after.get(factor, 0.0)) - c
+        if excess_before > 1e-9:
+            removed = 1.0 - max(excess_after, 0.0) / excess_before
+            if removed < caps.min_excess_removed:
+                plan.actions.append(
+                    HedgeAction(
+                        action="skip", symbol=inst.symbol, logical=key,
+                        factor=factor, side=side,
+                        reason=(
+                            f"{factor} leverage {lev:+.2f}x vs cap {c:.2f}x, but the "
+                            f"largest available hedge ({lots:.2f} lots {key}) only "
+                            f"reaches {after.get(factor, 0.0):+.2f}x — removing "
+                            f"{removed:.0%} of the excess, below the "
+                            f"{caps.min_excess_removed:.0%} minimum. Hedging here "
+                            f"would pay spread and swap for a cosmetic improvement "
+                            f"while leaving the book "
+                            f"{abs(after.get(factor, 0.0)) / c:.0f}x over cap. "
+                            f"REDUCE THE POSITION instead — an overlay cannot fix "
+                            f"position sizing."
+                        ),
+                    )
+                )
+                plan.reason = "hedge would be futile; position is too large"
+                return plan
+
         note = " (shrunk to avoid a collateral breach)" if shrunk else ""
         plan.actions.append(
             HedgeAction(

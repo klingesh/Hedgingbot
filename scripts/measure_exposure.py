@@ -170,6 +170,7 @@ def caps_from_config(cfg: dict) -> HedgeCaps:
         max_actions_per_cycle=int(limits.get("max_actions_per_cycle", 1)),
         max_hedges_per_day=int(limits.get("max_hedges_per_day", 6)),
         allow_unmapped=bool(limits.get("allow_unmapped", False)),
+        min_excess_removed=float(limits.get("min_excess_removed", 0.50)),
     )
 
 
