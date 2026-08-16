@@ -29,3 +29,7 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# Exported Tradingbot trade files (derived, reproducible, potentially large)
+data/*.json
+!data/README.txt
