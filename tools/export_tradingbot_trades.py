@@ -86,15 +86,27 @@ except ImportError as exc:
 #: Measured with Hedgingbot's scripts/check_account_mode.py on a live
 #: JustMarkets ECN demo account (login 1100219238). Used only when MT5 is
 #: unavailable. logical -> (broker symbol, tick_size, tick_value)
+#: All values below are now CONFIRMED against the live account. The first version
+#: guessed NATGAS and BRENT at tick_value=1.0 and both were wrong by 10x:
+#:
+#:     slot      guessed mppu    actual mppu
+#:     NATGAS           1,000         10,000
+#:     BRENT              100          1,000
+#:
+#: Since exposure is lots * mppu * price, that would have overstated nothing and
+#: UNDERSTATED those two positions' notional tenfold — a silent 10x error in every
+#: energy leverage figure. They were labelled "NOT verified" and preferring live
+#: MT5 is what saved it. Kept as a cautionary note: a plausible-looking spec table
+#: is not a substitute for asking the broker.
 FALLBACK_SPECS: dict[str, tuple[str, float, float]] = {
     "GOLD":     ("XAUUSD.ecn", 0.01,    1.0),
     "SILVER":   ("XAGUSD.ecn", 0.001,   5.0),
     "PLATINUM": ("XPTUSD.ecn", 0.01,    1.0),
-    "NATGAS":   ("XNGUSD.ecn", 0.001,   1.0),    # NOT verified — confirm on your account
-    "BRENT":    ("BRENT.ecn",  0.01,    1.0),    # NOT verified
-    "GBPJPY":   ("GBPJPY.ecn", 0.001,   0.6276675872457946),
+    "NATGAS":   ("XNGUSD.ecn", 0.001,  10.0),
+    "BRENT":    ("BRENT.ecn",  0.01,   10.0),
+    "GBPJPY":   ("GBPJPY.ecn", 0.001,   0.6290),   # FX-rate dependent, drifts
     "AUDUSD":   ("AUDUSD.ecn", 0.00001, 1.0),
-    "USDJPY":   ("USDJPY.ecn", 0.001,   0.6276675872457946),
+    "USDJPY":   ("USDJPY.ecn", 0.001,   0.6290),   # FX-rate dependent, drifts
 }
 
 #: Spread assumptions per asset class, matching Tradingbot's own experiments.
@@ -172,7 +184,8 @@ def load_specs(use_mt5: bool = True) -> tuple[dict[str, dict], str]:
                 return specs, "MetaTrader5 (live)"
 
     print("  MT5 unavailable — using the measured fallback table.")
-    print("  WARNING: NATGAS and BRENT specs in that table are NOT verified.")
+    print("  These are values measured on a live JustMarkets account. Confirm they")
+    print("  match YOUR account: a wrong tick_value scales notional directly.")
     for logical, (symbol, tick_size, tick_value) in FALLBACK_SPECS.items():
         specs[logical] = {
             "symbol": symbol, "tick_size": tick_size, "tick_value": tick_value,
@@ -339,7 +352,7 @@ def export(
 
     payload = {
         "schema": 1,
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "generated_at": pd.Timestamp.now("UTC").isoformat(),
         "source": "Tradingbot DEFAULT_PORTFOLIO backtest",
         "spec_source": spec_source,
         "balance": balance,
