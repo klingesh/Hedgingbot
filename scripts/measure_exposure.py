@@ -140,6 +140,61 @@ def demo_candidates() -> list[HedgeInstrument]:
 # ---------------------------------------------------------------------------
 
 
+#: Phase 1 has no order-placement path at all, so nothing can be sent regardless
+#: of config. Named explicitly so the budget-accounting branch below reads as a
+#: deliberate no-op rather than dead code.
+DRY_RUN_ALWAYS = True
+
+#: Tradingbot's magic number (src/live/portfolio.py / live_config.yaml). Sharing it
+#: would make the overlay mistake the trader's positions for its own hedges.
+TRADINGBOT_MAGIC = 990011
+
+
+def _beta_age_days(path: str) -> float | None:
+    """Age of the beta file in days, or None if it cannot be determined."""
+    import json as _json
+    from datetime import datetime, timezone
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            created = str(_json.load(fh).get("created_at", ""))
+    except (OSError, ValueError):
+        return None
+    if not created:
+        return None
+    try:
+        ts = datetime.fromisoformat(created)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 86400.0
+
+
+def _load_provenance(path: str) -> dict:
+    """ticket -> originating factor, for hedges this overlay opened.
+
+    Unwind decisions must use the factor a hedge was OPENED for, not whichever
+    factor its instrument currently ranks highest for (audit item 10). Betas are
+    re-estimated monthly and rankings move, so a hedge opened against USD can
+    later look like a METALS hedge and be unwound on the wrong signal.
+
+    Phase 1 opens nothing, so this is normally empty. Phase 2 must write an entry
+    when it places a hedge, and additionally stamp the factor into the MT5 order
+    comment so the mapping survives losing this file.
+    """
+    import json as _json
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: str(v) for k, v in raw.items() if isinstance(v, str)}
+
+
 def load_config(path: str) -> dict:
     """Load YAML config, falling back to a minimal parser if PyYAML is absent."""
     if not os.path.exists(path):
@@ -190,15 +245,44 @@ def measure_once(
     hedge_magic: int = 990012,
     trader_symbols: frozenset[str] = frozenset(),
     verbose: bool = True,
+    hedges_today: int = 0,
+    hedge_provenance: dict | None = None,
 ) -> tuple[object, object]:
     report = compute_exposure(positions, specs, book, equity)
 
     hedges = [p for p in positions if p.magic == hedge_magic]
+
+    # AVOID LIST FROM THE LIVE BOOK, not just from config.
+    #
+    #     5. Static avoid list / SILVER conflict — Live manual or other-EA
+    #        positions may not be protected; SILVER has conflicting roles.
+    #
+    # Two distinct problems. First, deriving `avoid` purely from `trader_symbols`
+    # misses anything the config does not know about: manual trades, another EA,
+    # a slot added to Tradingbot but not here. Those are real positions the
+    # overlay must not trade against. Second, SILVER is both a trader slot and the
+    # METALS hedge candidate, so on a netting account a "hedge" would silently
+    # reduce the trader's own silver position instead of hedging anything.
+    #
+    # Taking the union of configured symbols and every symbol currently held by
+    # someone else fixes both: any symbol another party holds is off-limits this
+    # cycle, whatever the config says.
+    others_hold = {p.symbol for p in positions if p.magic != hedge_magic}
+    avoid = frozenset(trader_symbols) | others_hold
+
     plan = hedge_decide(
         report, book, caps, candidates,
         existing_hedges=hedges, hedge_specs=specs,
-        avoid_symbols=trader_symbols,
+        avoid_symbols=avoid,
+        hedges_today=hedges_today,
+        hedge_provenance=hedge_provenance,
     )
+
+    blocked_by_live = sorted(others_hold - frozenset(trader_symbols))
+    if blocked_by_live and verbose:
+        print(f"\n  NOTE: {', '.join(blocked_by_live)} held by another party "
+              f"(manual or other EA) — excluded as hedge instruments this cycle "
+              f"even though config permits them.")
 
     if verbose:
         print(render(report, caps.factor_caps, currency))
@@ -208,6 +292,10 @@ def measure_once(
         print("=" * 78)
         print("WHAT THE OVERLAY WOULD DO (observe mode — nothing is sent)")
         print("=" * 78)
+        for w in getattr(plan, "warnings", []):
+            print(f"  WARNING: {w}")
+        if getattr(plan, "warnings", []):
+            print()
         print(f"  {plan.summary()}")
         if plan.has_trades:
             print("\n  Proposed order(s):")
@@ -270,6 +358,19 @@ def main() -> int:
     interval = args.interval or int(run.get("poll_seconds", 60))
     hedge_magic = int(run.get("magic_number", 990012))
 
+    # MAGIC COLLISION IS A RUNTIME CHECK, not just a preflight one.
+    #
+    #     "Hedge identification relies on the configured magic number, with no
+    #      runtime validation that it differs from the trader's magic number."
+    #
+    # If both bots share a magic, the overlay counts the trader's positions as its
+    # own hedges — and would then "unwind" them. Refuse to start.
+    if hedge_magic == TRADINGBOT_MAGIC:
+        print(f"FATAL: run.magic_number is {hedge_magic}, the same as Tradingbot's.")
+        print("The overlay would treat the trader's positions as its own hedges and")
+        print("could close them. Use a different magic, e.g. 990012.")
+        return 1
+
     trader_symbols = frozenset((cfg.get("trader_symbols") or {}).values())
 
     # ---- demo path -------------------------------------------------------
@@ -315,10 +416,27 @@ def main() -> int:
           f"(created {meta.get('created_at')}, age {meta.get('age_days', 0):.1f}d, "
           f"{len(book.instruments())} instruments)")
 
-    from src.connectors.mt5_reader import MT5Reader, MT5Unavailable
+    from src.connectors.mt5_reader import (
+        MT5Reader,
+        MT5Unavailable,
+        UnvaluablePosition,
+    )
 
     symbol_map = dict(cfg.get("trader_symbols") or {})
     symbol_map.update(cfg.get("hedge_instruments") or {})
+
+    # SINGLE INSTANCE. The config documented lock_path but nothing ever acquired
+    # it (audit item 7). Two observers are only wasteful; two EXECUTORS would each
+    # decide the same breach needs hedging and place the hedge twice, then see each
+    # other's position and potentially over-correct. Acquire it now so the
+    # behaviour is established before Phase 2 depends on it.
+    from src.state.lock import AlreadyRunning, hold
+
+    try:
+        hold(str(run.get("lock_path", os.path.join("logs", "hedge.lock"))))
+    except AlreadyRunning as exc:
+        print(f"FATAL: {exc}")
+        return 1
 
     reader = MT5Reader(symbol_map=symbol_map)
     if not reader.available():
@@ -349,14 +467,54 @@ def main() -> int:
     state.sync_baseline(acct.balance)
     state.overlay_mode = "observe"
 
+    beta_max_age = float(beta_cfg.get("max_age_days", 30))
+    provenance_path = str(run.get("provenance_path",
+                                  os.path.join("logs", "hedge_provenance.json")))
+    reported_spec_warnings: set[str] = set()
+
     try:
         while True:
             acct = reader.account()
             state.note_equity(acct.equity)
             state.roll_day(equity=acct.equity)
 
-            positions = reader.all_positions()
+            # BETA STALENESS IS RE-CHECKED EVERY CYCLE, not once at startup.
+            #
+            #     4. One-time beta staleness check — A long-running process can
+            #        continue using arbitrarily old betas.
+            #
+            # Exactly the situation observe mode creates: it is meant to run for
+            # WEEKS. Loading betas once and validating them once means that after
+            # 31 days it is happily sizing decisions from a file its own rules
+            # would refuse to load.
+            age_days = _beta_age_days(beta_path)
+            if age_days is not None and age_days > beta_max_age:
+                print(f"\n  BETAS ARE STALE: {age_days:.1f} days old "
+                      f"(limit {beta_max_age}). Measurement continues — knowing "
+                      f"your exposure with old betas beats knowing nothing — but "
+                      f"the numbers are drifting and NO hedge should be placed. "
+                      f"Run scripts\\update_betas.bat")
+                stale_betas = True
+            else:
+                stale_betas = False
+
+            try:
+                positions = reader.all_positions()
+            except UnvaluablePosition as exc:
+                # A position we cannot price means the book is incomplete. Skip the
+                # CYCLE, never the position — see UnvaluablePosition.
+                print(f"\n  SKIPPING THIS CYCLE: {exc}")
+                if not args.loop:
+                    return 1
+                time.sleep(interval)
+                continue
+
             specs = reader.specs_for(positions)
+
+            for w in reader.spec_warnings:
+                if w not in reported_spec_warnings:
+                    print(f"\n  BROKER DATA WARNING: {w}")
+                    reported_spec_warnings.add(w)
 
             candidates: list[HedgeInstrument] = []
             for logical, sym in (cfg.get("hedge_instruments") or {}).items():
@@ -372,7 +530,24 @@ def main() -> int:
                 positions, specs, book, acct.equity, caps, candidates,
                 currency=acct.currency, hedge_magic=hedge_magic,
                 trader_symbols=trader_symbols, verbose=not args.quiet,
+                hedges_today=state.hedge_count_today,
+                hedge_provenance=_load_provenance(provenance_path),
             )
+
+            if stale_betas:
+                plan.warnings.append(
+                    f"betas are {age_days:.1f} days old (limit {beta_max_age}); "
+                    "treat any proposed hedge as advisory only"
+                )
+
+            # Record executed hedges against the daily budget. In observe mode
+            # nothing is sent, so nothing is counted — but the wiring is here and
+            # exercised, rather than being a counter that exists and is never
+            # incremented (audit item 1: the daily budget was cosmetic because
+            # hedges_today was never passed in and note_hedge() was never called).
+            if not DRY_RUN_ALWAYS and plan.has_trades:
+                for _a in plan.trades():
+                    state.note_hedge()
 
             # Monitoring writes are individually guarded — the principle from
             # Tradingbot's HARDENING_LOG: monitoring must never be able to stop

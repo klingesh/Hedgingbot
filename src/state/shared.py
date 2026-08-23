@@ -131,10 +131,69 @@ class SharedPortfolioState:
             return fresh
 
     def save(self, path: str = DEFAULT_PATH, by: str = "") -> None:
+        """Persist, MERGING with whatever is on disk rather than overwriting it.
+
+        The audit flagged this:
+
+            N2 / 3. Shared-state clobber — A stale writer may overwrite a newer
+            halt flag or high-water mark. A stale full-state save can potentially
+            resurrect halted=False or regress the high-water mark.
+
+        Correct, and it matters because this file is SHARED. Two processes (the
+        trader and the overlay, or an observer and a future executor) each load a
+        copy, mutate their own, and write the whole dataclass back. Whoever writes
+        last wins — so an overlay that loaded before a halt was tripped would
+        cheerfully write `halted: false` back over it and re-arm a spent kill
+        switch. That is the precise failure Tradingbot's state.py was created to
+        prevent, reintroduced through a different door.
+
+        The merge is deliberately asymmetric, because these fields are not
+        symmetric in consequence:
+
+          * halted / day_halted are STICKY. Once either side halts, no writer can
+            clear it. Clearing requires a human deleting the file, which is the
+            documented procedure.
+          * peak_equity RATCHETS. Take the maximum, never the newer value.
+          * hedge_count_today takes the maximum, so a stale writer cannot hand back
+            budget that another process already spent.
+          * everything else is last-writer-wins, which is fine for descriptive
+            fields.
+        """
         self.updated_at = _utc_now_iso()
         if by:
             self.updated_by = by
-        _write_atomic(path, json.dumps(asdict(self), indent=2, sort_keys=True))
+
+        merged = asdict(self)
+        on_disk = SharedPortfolioState.load(path)
+
+        if on_disk.halted and not self.halted:
+            merged["halted"] = True
+            merged["halt_reason"] = on_disk.halt_reason
+            merged["halted_at"] = on_disk.halted_at
+        if on_disk.day_halted and not self.day_halted and on_disk.day == self.day:
+            merged["day_halted"] = True
+            merged["day_halt_reason"] = on_disk.day_halt_reason
+
+        merged["peak_equity"] = max(float(self.peak_equity),
+                                    float(on_disk.peak_equity))
+        if on_disk.start_balance > 0 and self.start_balance <= 0:
+            merged["start_balance"] = on_disk.start_balance
+        if on_disk.day == self.day:
+            merged["hedge_count_today"] = max(int(self.hedge_count_today),
+                                              int(on_disk.hedge_count_today))
+
+        # Reflect the merge back onto this instance so the in-memory view cannot
+        # disagree with the file it just wrote.
+        self.halted = bool(merged["halted"])
+        self.halt_reason = merged["halt_reason"]
+        self.halted_at = merged["halted_at"]
+        self.day_halted = bool(merged["day_halted"])
+        self.day_halt_reason = merged["day_halt_reason"]
+        self.peak_equity = float(merged["peak_equity"])
+        self.start_balance = float(merged["start_balance"])
+        self.hedge_count_today = int(merged["hedge_count_today"])
+
+        _write_atomic(path, json.dumps(merged, indent=2, sort_keys=True))
 
     # -- equity tracking ---------------------------------------------------
 

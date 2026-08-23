@@ -25,6 +25,7 @@ Two things this connector does that Tradingbot's does NOT
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from ..exposure.model import InstrumentSpec, Position
@@ -46,6 +47,26 @@ MARGIN_MODE_NAMES = {
 
 class MT5Unavailable(RuntimeError):
     """The MetaTrader5 package is not installed (non-Windows, usually)."""
+
+
+class UnvaluablePosition(RuntimeError):
+    """A live position exists that cannot be priced.
+
+    Raised rather than skipped. The previous code did:
+
+        price = float(getattr(p, "price_current", 0.0) or p.price_open)
+        if price <= 0:
+            continue          # <-- silently drops a REAL position
+
+    which removes live risk from the risk book with no warning at all. Every
+    downstream number — factor leverage, portfolio risk, breach detection — then
+    understates reality while looking perfectly healthy. That is the single worst
+    failure mode a risk system can have.
+
+    Skipping a CYCLE is safe (the next poll retries 60 seconds later). Skipping a
+    POSITION is not. So this propagates, and the live loop catches it, reports it
+    loudly, and measures nothing that cycle instead of measuring something wrong.
+    """
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,11 @@ class MT5Reader:
         self._logical_of = {v: k for k, v in self.symbol_map.items()}
         self._spec_cache: dict[str, InstrumentSpec] = {}
         self._connected = False
+        #: Non-fatal data-quality problems found while reading broker specs.
+        #: The caller is expected to surface these; they are conditions that
+        #: distort numbers without stopping anything, which is exactly the kind
+        #: of thing that goes unnoticed for weeks.
+        self.spec_warnings: list[str] = []
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -185,8 +211,25 @@ class MT5Reader:
         self.ensure_symbol(symbol)
         info = mt5.symbol_info(symbol)
 
-        tick_size = float(getattr(info, "trade_tick_size", 0.0)
-                          or getattr(info, "point", 0.0))
+        tick_size = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+        if tick_size <= 0:
+            # `point` is usually equal to trade_tick_size, but not always — on
+            # some symbols a tick spans several points. Since notional is
+            # tick_value/tick_size * price, substituting the wrong one scales
+            # EVERY downstream leverage figure. The fallback is kept because
+            # refusing outright would block symbols that work fine, but it is
+            # recorded so it can never pass unnoticed.
+            tick_size = float(getattr(info, "point", 0.0) or 0.0)
+            if tick_size > 0:
+                warning = (
+                    f"{symbol}: broker reported no trade_tick_size; fell back to "
+                    f"point={tick_size}. If a tick is not one point on this "
+                    f"symbol, its notional and leverage are WRONG by that ratio. "
+                    f"Verify with scripts/check_account_mode.py."
+                )
+                if warning not in self.spec_warnings:
+                    self.spec_warnings.append(warning)
+
         tick_value = float(getattr(info, "trade_tick_value", 0.0))
         if tick_size <= 0 or tick_value <= 0:
             raise ValueError(
@@ -232,10 +275,22 @@ class MT5Reader:
             return []
 
         out: list[Position] = []
+        unvaluable: list[str] = []
         for p in raw:
             side = 1 if int(p.type) == int(mt5.POSITION_TYPE_BUY) else -1
-            price = float(getattr(p, "price_current", 0.0) or p.price_open)
+            # price_current is the mark; price_open is a valid fallback because a
+            # position always had a real entry price.
+            price = float(getattr(p, "price_current", 0.0) or 0.0)
             if price <= 0:
+                price = float(getattr(p, "price_open", 0.0) or 0.0)
+            if price <= 0 or not math.isfinite(price):
+                # Do NOT skip. See UnvaluablePosition.
+                unvaluable.append(
+                    f"ticket {getattr(p, 'ticket', '?')} {getattr(p, 'symbol', '?')} "
+                    f"volume {getattr(p, 'volume', '?')} "
+                    f"(price_current={getattr(p, 'price_current', None)!r}, "
+                    f"price_open={getattr(p, 'price_open', None)!r})"
+                )
                 continue
             out.append(
                 Position(
@@ -247,6 +302,13 @@ class MT5Reader:
                     magic=int(p.magic),
                     logical=self._logical_of.get(str(p.symbol), ""),
                 )
+            )
+        if unvaluable:
+            raise UnvaluablePosition(
+                f"{len(unvaluable)} live position(s) cannot be priced, so the risk "
+                f"book would be incomplete: {'; '.join(unvaluable)}. "
+                "Refusing to report a partial book — measuring nothing is safer "
+                "than measuring less than everything."
             )
         return out
 
