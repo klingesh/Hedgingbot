@@ -145,5 +145,13 @@ run:
   lock_path: logs/hedge.lock
   state_path: logs/portfolio_state.json
   status_path: logs/hedge_status.json
-  # Read-only peek at the trader's heartbeat, for logging context only.
-  trader_status_path: logs/status.json
+  # Read-only peek at TRADINGBOT's heartbeat, so the overlay can report whether
+  # the trader is alive and confirm both bots see the same account.
+  #
+  # THIS MUST BE AN ABSOLUTE PATH TO THE TRADINGBOT REPO. A relative path
+  # resolves against Hedgingbot's own directory, where there is no trader
+  # status file, so it silently finds nothing forever.
+  #
+  # Windows example (forward slashes are fine in YAML and avoid escaping):
+  #   trader_status_path: C:/Tradingbot/logs/status.json
+  trader_status_path: C:/Tradingbot/logs/status.json

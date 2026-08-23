@@ -29,6 +29,14 @@ that, and they ARE the product:
    before it is allowed. A hedge that fixes USD by pushing RISK into breach is
    shrunk until it stops doing that, or rejected. Hand-rolled hedging bots never
    have this guard, and it is the difference between reducing risk and moving it.
+   It covers three kinds of damage: creating a new breach, WORSENING a breach that
+   already existed, and materially loading an UNCAPPED factor nobody is watching.
+   See _collateral_damage() — the first version caught only the first case.
+
+8. RISK MUST ACTUALLY FALL. Cap compliance is a proxy. The final check simulates
+   total portfolio 1-sigma risk and refuses a hedge that does not reduce it. A
+   trade can satisfy every cap and still raise total risk, because caps constrain
+   factors one at a time while risk aggregates them.
 
 6. DAILY ACTION BUDGET. A hard ceiling on hedges per day. If the overlay wants to
    trade more than a handful of times a day, the caps are wrong — and the budget
@@ -56,6 +64,7 @@ import math
 from dataclasses import dataclass, field
 
 from ..exposure.model import ExposureReport, InstrumentSpec, Position
+from ._attempt import Attempt, hedge_gross_notional, total_risk_after
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +190,10 @@ class HedgePlan:
     breaches: dict[str, float] = field(default_factory=dict)
     blocked: bool = False
     reason: str = ""
+    #: Non-fatal conditions the operator should see — e.g. a factor with no cap
+    #: configured, or a hedge whose originating factor had to be guessed. These do
+    #: not stop the overlay but they mean something is not as intended.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def has_trades(self) -> bool:
@@ -236,17 +249,49 @@ def _simulate_leverage(
     return out
 
 
-def _new_breaches(
+def _collateral_damage(
     before: dict[str, float], after: dict[str, float], caps: HedgeCaps, exclude: str,
+    worsen_tolerance: float = 0.02,
 ) -> list[str]:
-    """Factors inside their cap before and outside it after."""
+    """Factors a proposed hedge would damage, other than the one being fixed.
+
+    Three kinds of damage, all of which the original check missed:
+
+    1. NEW BREACH — inside its cap before, outside after. This was the only case
+       the original version caught.
+
+    2. WORSENED EXISTING BREACH — already outside its cap and pushed FURTHER out.
+       The original test was `abs(before) <= c and abs(after) > c`, so a factor
+       already in breach could be made arbitrarily worse and the check stayed
+       silent. On a book with several simultaneous breaches — which is exactly
+       when hedging matters — that is the common case, not the edge case.
+
+    3. UNCAPPED FACTOR MATERIALLY WORSENED — the original skipped any factor with
+       no cap entirely. "No cap configured" usually means nobody got round to it,
+       not "unlimited is fine", so a hedge could quietly load up a factor nobody
+       is watching. Uncapped factors are judged on relative growth instead.
+
+    `worsen_tolerance` allows a hair of numerical slack so floating-point dust
+    does not read as damage.
+    """
     bad: list[str] = []
     for f, lev_after in after.items():
-        if f == exclude or not caps.has_cap(f):
+        if f == exclude:
             continue
-        c = caps.cap(f)
-        if abs(before.get(f, 0.0)) <= c and abs(lev_after) > c:
-            bad.append(f)
+        b = abs(before.get(f, 0.0))
+        a = abs(lev_after)
+
+        if caps.has_cap(f):
+            c = caps.cap(f)
+            if b <= c and a > c:
+                bad.append(f)                       # (1) new breach
+            elif b > c and a > b * (1.0 + worsen_tolerance):
+                bad.append(f)                       # (2) worsened breach
+        else:
+            # (3) uncapped: flag material growth. The absolute floor stops a
+            # factor with near-zero exposure being flagged for noise.
+            if a > max(b * 1.25, 0.25) and a > b + 0.05:
+                bad.append(f)
     return bad
 
 
@@ -291,6 +336,7 @@ def hedge_decide(
     flatten: bool = False,
     avoid_symbols=(),
     hedges_today: int = 0,
+    hedge_provenance: dict | None = None,
 ) -> HedgePlan:
     """Decide what the overlay should do right now.
 
@@ -345,6 +391,24 @@ def hedge_decide(
     breaches = report.breaches(caps.factor_caps)
     plan.breaches = breaches
     before = dict(report.factor_leverage)
+    provenance = dict(hedge_provenance or {})
+
+    # Factor volatilities, needed by the risk-must-fall check. Taken from the beta
+    # book so they are the same sigmas the exposure report was built with.
+    getter = getattr(betas, "factor_sigmas", None)
+    factor_sigma = getter() if callable(getter) else {}
+
+    # A factor with no configured cap is treated as UNLIMITED, which the audit
+    # flagged: "Factors missing from the caps configuration are silently treated
+    # as unlimited. A configuration typo could therefore remove a risk limit
+    # without an explicit failure." Surface it instead of swallowing it.
+    uncapped = [f for f in report.factors if not caps.has_cap(f)]
+    if uncapped:
+        plan.warnings.append(
+            f"no cap configured for {', '.join(uncapped)} — treated as UNLIMITED. "
+            "If that is not deliberate, it is a config typo that has removed a risk "
+            "limit."
+        )
 
     # ---- 1. unwinding takes priority over opening ------------------------
     # A hedge that is no longer needed is pure drag: it costs spread, margin and
@@ -353,7 +417,34 @@ def hedge_decide(
     # budget — running out of budget must never trap the account in a stale hedge.
     for h in existing_hedges:
         key = h.logical or h.symbol
-        factor = _primary_factor(betas, key, report.factors)
+        # PROVENANCE. Prefer the factor this hedge was actually OPENED for, looked
+        # up by ticket. Falling back to "whichever factor this instrument currently
+        # ranks highest for" is what the audit flagged:
+        #
+        #     10. Unwind provenance gap — Changing beta rankings can cause existing
+        #         hedges to be evaluated against the wrong factor.
+        #
+        # Betas are re-estimated monthly. A hedge opened to offset USD can, after a
+        # refresh, rank highest for METALS — and would then be unwound based on
+        # METALS leverage while the USD breach it exists to cover is still live.
+        factor = provenance.get(h.ticket) or provenance.get(str(h.ticket))
+        if factor:
+            if factor not in report.factors:
+                plan.warnings.append(
+                    f"hedge ticket {h.ticket} records factor {factor!r}, which is not "
+                    f"in the current factor set {list(report.factors)} — ignoring it "
+                    "and falling back to the current dominant factor"
+                )
+                factor = ""
+        if not factor:
+            factor = _primary_factor(betas, key, report.factors)
+            if h.ticket:
+                plan.warnings.append(
+                    f"no recorded factor for hedge ticket {h.ticket} ({key}); guessed "
+                    f"{factor!r} from current betas. Phase 2 must stamp the "
+                    "originating factor into the order comment so unwind decisions "
+                    "cannot drift when betas are re-estimated."
+                )
         if not factor or not caps.has_cap(factor):
             continue
         c = caps.cap(factor)
@@ -417,8 +508,85 @@ def hedge_decide(
         plan.reason = "daily hedge budget spent"
         return plan
 
-    # Worst breach first. One factor per cycle.
-    factor = max(actionable, key=lambda f: abs(actionable[f]))
+    # ---- 4. gross hedge ceiling (book-wide, so checked once) -------------
+    hedge_gross = hedge_gross_notional(existing_hedges, hedge_specs)
+    gross_ceiling = report.equity * caps.max_hedge_gross_pct / 100.0
+
+    if hedge_gross >= gross_ceiling:
+        worst = max(actionable, key=lambda f: abs(actionable[f]))
+        plan.actions.append(
+            HedgeAction(
+                action="skip", factor=worst,
+                reason=(f"hedge gross notional {hedge_gross:,.0f} is at the ceiling "
+                        f"{gross_ceiling:,.0f} ({caps.max_hedge_gross_pct:.0f}% of "
+                        f"equity) — {worst} breach "
+                        f"{before.get(worst, 0.0):+.2f}x left unhedged"),
+            )
+        )
+        plan.reason = "hedge gross ceiling reached"
+        return plan
+
+    # ---- 5. try each breaching factor, worst first -----------------------
+    #
+    # Iterating rather than taking only the worst fixes "breach starvation": the
+    # original code picked max(actionable) and returned on every failure path, so
+    # an unhedgeable largest breach blocked a smaller hedgeable one. On the live
+    # book that was the real situation — USD at 43x was futile to hedge while
+    # METALS and RISK were also breaching.
+    ordered = sorted(actionable, key=lambda f: abs(actionable[f]), reverse=True)
+    attempts: list[Attempt] = []
+
+    for factor in ordered:
+        attempt = _attempt_factor(
+            factor=factor, report=report, betas=betas, caps=caps,
+            candidates=candidates, avoid=avoid, before=before,
+            hedge_gross=hedge_gross, gross_ceiling=gross_ceiling,
+            factor_sigma=factor_sigma,
+        )
+        attempts.append(attempt)
+        if attempt.action is not None:
+            plan.actions.append(attempt.action)
+            plan.reason = f"hedging {factor}"
+            if len(attempts) > 1:
+                skipped = ", ".join(
+                    f"{a.factor} ({a.category})" for a in attempts[:-1]
+                )
+                plan.reason += f" (could not hedge {skipped} first)"
+            return plan
+
+    # Nothing was hedgeable. Report the WORST factor's reason as the headline,
+    # since that is the most important thing left unaddressed, and summarise the
+    # rest so the journal shows the whole picture rather than one symptom.
+    primary = attempts[0]
+    extra = ""
+    if len(attempts) > 1:
+        extra = "  Also unhedgeable: " + "; ".join(
+            f"{a.factor} — {a.category}" for a in attempts[1:]
+        )
+    plan.actions.append(
+        HedgeAction(
+            action="skip", factor=primary.factor,
+            reason=primary.note + extra,
+        )
+    )
+    plan.reason = primary.category or "no hedge possible"
+    return plan
+
+
+def _attempt_factor(
+    *,
+    factor: str,
+    report: ExposureReport,
+    betas,
+    caps: HedgeCaps,
+    candidates: list[HedgeInstrument],
+    avoid: frozenset,
+    before: dict[str, float],
+    hedge_gross: float,
+    gross_ceiling: float,
+    factor_sigma: dict,
+) -> Attempt:
+    """Try to build a hedge for one factor. Never raises; never returns a plan."""
     lev = before.get(factor, 0.0)
     c = caps.cap(factor)
 
@@ -427,28 +595,9 @@ def hedge_decide(
     target_lev = sign * c * caps.target_fraction
     exposure_to_remove = (lev - target_lev) * report.equity
 
-    # ---- 4. gross hedge ceiling ------------------------------------------
-    hedge_gross = 0.0
-    for h in existing_hedges:
-        spec = hedge_specs.get(h.symbol)
-        if spec is None:
-            continue
-        hedge_gross += abs(h.volume * spec.money_per_price_unit_per_lot * h.price)
-    gross_ceiling = report.equity * caps.max_hedge_gross_pct / 100.0
+    risk_before = report.portfolio_daily_risk
 
-    if hedge_gross >= gross_ceiling:
-        plan.actions.append(
-            HedgeAction(
-                action="skip", factor=factor,
-                reason=(f"hedge gross notional {hedge_gross:,.0f} is at the ceiling "
-                        f"{gross_ceiling:,.0f} ({caps.max_hedge_gross_pct:.0f}% of "
-                        f"equity) — {factor} breach {lev:+.2f}x left unhedged"),
-            )
-        )
-        plan.reason = "hedge gross ceiling reached"
-        return plan
-
-    # ---- 5. choose the hedge instrument ----------------------------------
+    # ---- choose the hedge instrument -------------------------------------
     usable: list[tuple[float, HedgeInstrument, str]] = []
     rejected: list[str] = []
     for inst in candidates:
@@ -473,21 +622,27 @@ def hedge_decide(
         usable.append((_score_candidate(betas, name, factor, inst), inst, name))
 
     if not usable:
-        plan.actions.append(
-            HedgeAction(
-                action="skip", factor=factor,
-                reason=(f"{factor} leverage {lev:+.2f}x breaches cap {c:.2f}x but no "
-                        f"usable hedge instrument: "
-                        f"{'; '.join(rejected) or 'no candidates supplied'}"),
-            )
+        return Attempt(
+            factor=factor, action=None, category="no usable hedge instrument",
+            note=(f"{factor} leverage {lev:+.2f}x breaches cap {c:.2f}x but no "
+                  f"usable hedge instrument: "
+                  f"{'; '.join(rejected) or 'no candidates supplied'}"),
         )
-        plan.reason = "no usable hedge instrument"
-        return plan
 
     usable.sort(key=lambda t: t[0], reverse=True)
 
-    # ---- 6. size it, then verify it does not break something else --------
-    last_collateral: list[str] = []
+    # ---- size it, then verify it does not break something else -----------
+    #
+    # Every failure below `continue`s to the next CANDIDATE rather than returning.
+    # The audit flagged this too:
+    #
+    #     "Minimum-lot early return: failure to fit one candidate can stop the
+    #      search before another viable candidate is considered."
+    #
+    # so a coarse-lot instrument first in the ranking used to veto a finer-grained
+    # one that would have worked.
+    last_note = ""
+    last_category = "all candidates unusable"
     for _score, inst, key in usable:
         b = betas.beta(key, factor)
         # Adding notional N shifts factor exposure by N * b; we want the shift to
@@ -503,37 +658,28 @@ def hedge_decide(
         lots = _round_down_to_step(raw_lots, inst.spec)
 
         if lots < inst.spec.volume_min:
-            plan.actions.append(
-                HedgeAction(
-                    action="skip", symbol=inst.symbol, logical=key, factor=factor,
-                    side=side,
-                    reason=(f"{factor} breach {lev:+.2f}x needs only {raw_lots:.4f} lots "
-                            f"of {key}, below volume_min {inst.spec.volume_min} — "
-                            "refusing to round up into an oversized hedge"),
-                )
-            )
-            plan.reason = "required hedge below minimum lot"
-            return plan
+            last_category = "required hedge below minimum lot"
+            last_note = (f"{factor} breach {lev:+.2f}x needs only {raw_lots:.4f} lots "
+                         f"of {key}, below volume_min {inst.spec.volume_min} — "
+                         "refusing to round up into an oversized hedge")
+            rejected.append(f"{key}(needs {raw_lots:.4f} < min {inst.spec.volume_min})")
+            continue
 
         # Respect the gross ceiling for the new leg too.
         room = gross_ceiling - hedge_gross
         if lots * per_lot > room:
             capped = _round_down_to_step(room / per_lot, inst.spec)
             if capped < inst.spec.volume_min:
-                plan.actions.append(
-                    HedgeAction(
-                        action="skip", symbol=inst.symbol, logical=key, factor=factor,
-                        reason=(f"only {room:,.0f} of hedge notional headroom remains, "
-                                f"below one minimum lot of {key} "
-                                f"({per_lot * inst.spec.volume_min:,.0f})"),
-                    )
-                )
-                plan.reason = "insufficient hedge headroom"
-                return plan
+                last_category = "insufficient hedge headroom"
+                last_note = (f"only {room:,.0f} of hedge notional headroom remains, "
+                             f"below one minimum lot of {key} "
+                             f"({per_lot * inst.spec.volume_min:,.0f})")
+                rejected.append(f"{key}(no headroom)")
+                continue
             lots = capped
 
-        # Collateral-damage check: shrink while the hedge creates a NEW breach.
-        collateral = _new_breaches(
+        # Collateral-damage check: shrink while the hedge damages another factor.
+        collateral = _collateral_damage(
             before, _simulate_leverage(report, betas, side * lots * per_lot, key),
             caps, exclude=factor,
         )
@@ -545,19 +691,22 @@ def hedge_decide(
                 break
             lots = smaller
             shrunk = True
-            collateral = _new_breaches(
+            collateral = _collateral_damage(
                 before, _simulate_leverage(report, betas, side * lots * per_lot, key),
                 caps, exclude=factor,
             )
 
         if lots < inst.spec.volume_min or collateral:
-            last_collateral = collateral
+            last_category = "would damage another factor"
+            last_note = (f"{factor} leverage {lev:+.2f}x cannot be hedged with {key} "
+                         f"without damaging {','.join(collateral) or 'another factor'}")
             rejected.append(
-                f"{key}(cannot size without breaching {','.join(collateral) or '?'})"
+                f"{key}(would damage {','.join(collateral) or '?'})"
             )
             continue
 
-        after = _simulate_leverage(report, betas, side * lots * per_lot, key)
+        added_notional = side * lots * per_lot
+        after = _simulate_leverage(report, betas, added_notional, key)
 
         # ---- FUTILITY CHECK ------------------------------------------------
         # Found by running against a real account. A 1-lot short gold position on
@@ -567,59 +716,66 @@ def hedge_decide(
         # leaving the book 22x over its cap, and costing ~3.4% of equity a month
         # in swap plus the spread.
         #
-        # That is not risk management. It is paying a recurring fee for a
-        # cosmetic improvement, and worse, it creates the impression the risk has
-        # been dealt with. When a breach is this far beyond what a hedge can
-        # reach, the honest answer is that the POSITION is too big — and the
-        # overlay cannot fix position sizing, so it must say so and stop.
+        # That is not risk management. It is paying a recurring fee for a cosmetic
+        # improvement, and worse, it creates the impression the risk has been dealt
+        # with. When a breach is this far beyond what a hedge can reach, the honest
+        # answer is that the POSITION is too big — and an overlay cannot fix
+        # position sizing, so it must say so.
         excess_before = abs(lev) - c
         excess_after = abs(after.get(factor, 0.0)) - c
         if excess_before > 1e-9:
             removed = 1.0 - max(excess_after, 0.0) / excess_before
             if removed < caps.min_excess_removed:
-                plan.actions.append(
-                    HedgeAction(
-                        action="skip", symbol=inst.symbol, logical=key,
-                        factor=factor, side=side,
-                        reason=(
-                            f"{factor} leverage {lev:+.2f}x vs cap {c:.2f}x, but the "
-                            f"largest available hedge ({lots:.2f} lots {key}) only "
-                            f"reaches {after.get(factor, 0.0):+.2f}x — removing "
-                            f"{removed:.0%} of the excess, below the "
-                            f"{caps.min_excess_removed:.0%} minimum. Hedging here "
-                            f"would pay spread and swap for a cosmetic improvement "
-                            f"while leaving the book "
-                            f"{abs(after.get(factor, 0.0)) / c:.0f}x over cap. "
-                            f"REDUCE THE POSITION instead — an overlay cannot fix "
-                            f"position sizing."
-                        ),
-                    )
+                last_category = "hedge would be futile; position is too large"
+                last_note = (
+                    f"{factor} leverage {lev:+.2f}x vs cap {c:.2f}x, but the "
+                    f"largest available hedge ({lots:.2f} lots {key}) only "
+                    f"reaches {after.get(factor, 0.0):+.2f}x — removing "
+                    f"{removed:.0%} of the excess, below the "
+                    f"{caps.min_excess_removed:.0%} minimum. Hedging here would "
+                    f"pay spread and swap for a cosmetic improvement while "
+                    f"leaving the book {abs(after.get(factor, 0.0)) / c:.0f}x "
+                    f"over cap. REDUCE THE POSITION instead — an overlay cannot "
+                    f"fix position sizing."
                 )
-                plan.reason = "hedge would be futile; position is too large"
-                return plan
+                rejected.append(f"{key}(futile: removes only {removed:.0%})")
+                continue
 
-        note = " (shrunk to avoid a collateral breach)" if shrunk else ""
-        plan.actions.append(
-            HedgeAction(
+        # ---- RISK MUST ACTUALLY FALL ---------------------------------------
+        # Cap compliance is a proxy. Caps constrain factors one at a time; total
+        # risk aggregates them in quadrature, so a hedge can satisfy every cap and
+        # still raise total risk — e.g. trading a quiet factor down while pushing a
+        # loud one up, since contribution scales with a factor's own volatility.
+        risk_after = total_risk_after(report, betas, added_notional, key, factor_sigma)
+        if risk_before > 1e-9 and risk_after >= risk_before:
+            last_category = "hedge would not reduce total risk"
+            last_note = (
+                f"{factor} leverage {lev:+.2f}x vs cap {c:.2f}x, but {lots:.2f} lots "
+                f"{key} would move total portfolio 1-sigma risk "
+                f"{risk_before:,.0f} -> {risk_after:,.0f}. Cap compliance is not the "
+                f"objective; lower risk is. Refusing."
+            )
+            rejected.append(f"{key}(risk would not fall)")
+            continue
+
+        note = " (shrunk to avoid collateral damage)" if shrunk else ""
+        return Attempt(
+            factor=factor, category="hedged",
+            note=f"hedging {factor} with {lots:.2f} lots {key}",
+            action=HedgeAction(
                 action="open", symbol=inst.symbol, logical=key, side=side, lots=lots,
                 factor=factor,
                 reason=(f"{factor} leverage {lev:+.2f}x vs cap {c:.2f}x -> "
                         f"{lots:.2f} lots {key} (beta {b:+.2f}, purity "
                         f"{betas.purity(key, factor):.2f}); projected {factor} "
-                        f"{after.get(factor, 0.0):+.2f}x{note}"),
-            )
+                        f"{after.get(factor, 0.0):+.2f}x, total risk "
+                        f"{risk_before:,.0f} -> {risk_after:,.0f}{note}"),
+            ),
         )
-        plan.reason = f"hedging {factor}"
-        return plan
 
-    plan.actions.append(
-        HedgeAction(
-            action="skip", factor=factor,
-            reason=(f"{factor} leverage {lev:+.2f}x breaches cap {c:.2f}x but every "
-                    f"candidate was unusable: {'; '.join(rejected)}"
-                    + (f" (last collateral breach: {','.join(last_collateral)})"
-                       if last_collateral else "")),
-        )
+    return Attempt(
+        factor=factor, action=None, category=last_category,
+        note=(last_note or
+              (f"{factor} leverage {lev:+.2f}x breaches cap {c:.2f}x but every "
+               f"candidate was unusable: {'; '.join(rejected)}")),
     )
-    plan.reason = "all candidates unusable"
-    return plan

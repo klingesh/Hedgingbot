@@ -82,8 +82,43 @@ class _RuntimeUnionFinder(ast.NodeVisitor):
         for dec in node.decorator_list:
             self.visit(dec)
 
+    #: Builtin/typing names that appearing in `X | Y` means a TYPE union rather
+    #: than arithmetic.
+    TYPE_NAMES = frozenset({
+        "int", "str", "float", "bool", "bytes", "complex", "object",
+        "list", "dict", "set", "tuple", "frozenset", "bytearray",
+        "Any", "Optional", "Union", "Callable", "Sequence", "Mapping",
+        "Iterable", "Iterator", "Awaitable", "Coroutine", "Type",
+    })
+
+    def _looks_like_a_type(self, node: ast.expr) -> bool:
+        """Is this operand plausibly a type rather than a number?
+
+        The first version flagged EVERY BitOr, which made
+        `fcntl.LOCK_EX | fcntl.LOCK_NB` — an ordinary bitwise OR of two ints —
+        look like a Python 3.10 syntax problem. A checker that cries wolf on
+        legitimate bit flags gets deleted, so it has to discriminate.
+
+        `X | None` is the overwhelmingly common PEP 604 form and is decisive.
+        Otherwise a bare builtin type name, or a subscripted generic like
+        `list[int]`, is treated as a type.
+        """
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True
+        if isinstance(node, ast.Name) and node.id in self.TYPE_NAMES:
+            return True
+        if isinstance(node, ast.Subscript):
+            return self._looks_like_a_type(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return (self._looks_like_a_type(node.left)
+                    or self._looks_like_a_type(node.right))
+        return False
+
     def visit_BinOp(self, node: ast.BinOp) -> None:
-        if isinstance(node.op, ast.BitOr):
+        if isinstance(node.op, ast.BitOr) and (
+            self._looks_like_a_type(node.left)
+            or self._looks_like_a_type(node.right)
+        ):
             self.hits.append((node.lineno, ast.unparse(node)
                               if hasattr(ast, "unparse") else "X | Y"))
         self.generic_visit(node)
@@ -218,3 +253,49 @@ def test_no_runtime_import_of_pandas_or_numpy():
         "the overlay must stay stdlib-only so it runs on a bare VPS and the "
         "hedge-sizing maths stays readable:\n  " + "\n  ".join(offenders)
     )
+
+
+
+# ---------------------------------------------------------------------------
+# The union checker must discriminate types from bit flags
+# ---------------------------------------------------------------------------
+
+
+def _union_hits(source: str) -> list[str]:
+    tree = ast.parse(source)
+    finder = _RuntimeUnionFinder()
+    for stmt in tree.body:
+        finder.visit(stmt)
+    return [snippet for _lineno, snippet in finder.hits]
+
+
+def test_checker_flags_a_real_pep604_type_alias():
+    """The bug it exists for: a module-level alias evaluated at import time."""
+    assert _union_hits("Series = list[float | None]")
+    assert _union_hits("Thing = int | str")
+    assert _union_hits("X: object = None\nY = str | None")
+
+
+def test_checker_ignores_bitwise_or_of_flags():
+    """fcntl.LOCK_EX | fcntl.LOCK_NB is arithmetic, not a type union.
+
+    The first version flagged every BitOr and reported src/state/lock.py as a
+    Python 3.10 problem. A checker that cries wolf on legitimate bit flags gets
+    deleted, which would lose the real protection.
+    """
+    assert _union_hits("mode = fcntl.LOCK_EX | fcntl.LOCK_NB") == []
+    assert _union_hits("flags = 0x01 | 0x02") == []
+    assert _union_hits("mask = a | b") == []
+    assert _union_hits("perm = stat.S_IRUSR | stat.S_IWUSR") == []
+
+
+def test_checker_still_ignores_deferred_annotations():
+    """Annotations are strings under `from __future__ import annotations`, so a
+    union there is harmless and must not be flagged."""
+    assert _union_hits("def f(x: int | None = None) -> str | None: ...") == []
+    assert _union_hits("class C:\n    field: float | None") == []
+
+
+def test_checker_catches_a_union_in_a_default_VALUE():
+    """Default values ARE evaluated at definition time, unlike annotations."""
+    assert _union_hits("def f(t=int | None): ...")

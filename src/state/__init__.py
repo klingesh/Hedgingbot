@@ -13,3 +13,7 @@ __all__ = [
     "read_trader_status",
     "write_overlay_status",
 ]
+
+from .lock import AlreadyRunning, SingleInstance, hold, release  # noqa: E402
+
+__all__ += ["AlreadyRunning", "SingleInstance", "hold", "release"]

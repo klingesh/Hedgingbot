@@ -276,6 +276,9 @@ def check_config(c: Checks, reader) -> dict:
     except Exception as exc:                                  # noqa: BLE001
         c.add(WARN, "Could not validate caps", repr(exc))
 
+    # ---- is Tradingbot actually alive, and on THIS account? ---------------
+    _check_trader_heartbeat(c, cfg, reader)
+
     # ---- do the configured broker symbols actually exist? ----------------
     trader_symbols = dict(cfg.get("trader_symbols") or {})
     hedge_symbols = dict(cfg.get("hedge_instruments") or {})
@@ -315,6 +318,126 @@ def check_config(c: Checks, reader) -> dict:
         c.add(PASS, f"All {good} configured symbols resolve at your broker")
 
     return cfg
+
+
+def _check_trader_heartbeat(c: Checks, cfg: dict, reader) -> None:
+    """Is Tradingbot running, and is it on the SAME account we are watching?
+
+    This check exists because of a real deployment mistake. The overlay was
+    installed on a machine whose MT5 terminal was logged into the same demo
+    account the user had manually traded, and everything came back green — while
+    Tradingbot itself was elsewhere. The observer would have recorded weeks of
+    data about the wrong book, and nothing in the output would have said so.
+
+    An overlay measuring an account that is not the one it is protecting is worse
+    than no overlay: the numbers look authoritative and describe something else.
+    """
+    from datetime import datetime, timezone
+
+    from src.state.shared import read_trader_status
+
+    run = cfg.get("run") or {}
+    path = str(run.get("trader_status_path", ""))
+
+    if not path:
+        c.add(WARN, "No run.trader_status_path configured",
+              "Cannot confirm Tradingbot is alive or that both bots see the same "
+              "account. Set it to an ABSOLUTE path, e.g.\n"
+              "    trader_status_path: C:/Tradingbot/logs/status.json")
+        return
+
+    if not os.path.isabs(path) and not (len(path) > 1 and path[1] == ":"):
+        c.add(FAIL, f"trader_status_path {path!r} is RELATIVE",
+              "It resolves against Hedgingbot's own directory, where no trader "
+              "status file exists, so it will silently find nothing forever.\n"
+              "Use an absolute path:\n"
+              "    trader_status_path: C:/Tradingbot/logs/status.json")
+        return
+
+    status = read_trader_status(path)
+    if not status:
+        c.add(FAIL, f"No Tradingbot heartbeat at {path}",
+              "Either the path is wrong, or Tradingbot is not running.\n"
+              "Check that the file exists and that Tradingbot is live:\n"
+              f"    type {path.replace('/', chr(92))}\n"
+              "If Tradingbot is running but has never written it, confirm it is "
+              "the hardened version that calls write_status().")
+        return
+
+    # How stale is it? Tradingbot polls every 60s by default.
+    age_txt = "unknown age"
+    stale = False
+    updated = str(status.get("updated_at", ""))
+    if updated:
+        try:
+            ts = datetime.fromisoformat(updated)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+            age_txt = f"last updated {age_min:.1f} min ago"
+            stale = age_min > 15.0
+        except ValueError:
+            pass
+
+    detail = (f"{age_txt}; equity={status.get('equity')} "
+              f"halted={status.get('halted')} "
+              f"open_positions={len(status.get('open_positions') or [])}")
+
+    if stale:
+        c.add(WARN, "Tradingbot heartbeat is STALE", detail
+              + "\nTradingbot polls every 60s, so a gap this long means it is "
+                "stopped, crashed, or hung. The overlay will keep measuring the "
+                "account regardless — broker SL/TP stay live even when the trader "
+                "is dead — but nothing new will be opened.")
+    else:
+        c.add(PASS, "Tradingbot heartbeat found", detail)
+
+    # ---- the important part: SAME ACCOUNT? -------------------------------
+    if reader is None:
+        return
+    try:
+        ours = reader.account()
+    except Exception:                                          # noqa: BLE001
+        return
+
+    trader_login = status.get("login")
+    if trader_login is None:
+        c.add(WARN, "Tradingbot status has no login field",
+              "Cannot verify both bots are on the same account.")
+    elif int(trader_login) != int(ours.login):
+        c.add(FAIL,
+              f"DIFFERENT ACCOUNTS: Tradingbot is on {trader_login}, "
+              f"the overlay is on {ours.login}",
+              "The overlay is measuring an account it is not protecting. Every "
+              "number it produces would describe the wrong book. Point both at "
+              "the same MT5 terminal before continuing.")
+    else:
+        c.add(PASS, f"Both bots are on account {ours.login}")
+
+    # ---- and does the trader actually hold anything? ---------------------
+    try:
+        positions = reader.all_positions()
+    except Exception:                                          # noqa: BLE001
+        return
+
+    magic = int(run.get("magic_number", 990012))
+    trader_magics = sorted({p.magic for p in positions if p.magic not in (0, magic)})
+    manual = [p for p in positions if p.magic == 0]
+
+    if trader_magics:
+        n = sum(1 for p in positions if p.magic in trader_magics)
+        c.add(PASS, f"{n} position(s) with a bot magic {trader_magics} — "
+                    "the trader's book is visible")
+    elif manual:
+        c.add(WARN, f"Only manual positions visible (magic 0): {len(manual)}",
+              "Tradingbot has nothing open right now. That is normal for an H4 "
+              "portfolio between signals, but it means observe mode is currently "
+              "measuring your MANUAL trades, not the strategy book. Calibrating "
+              "caps from this would calibrate them to the wrong thing.")
+    else:
+        c.add(WARN, "No open positions at all",
+              "Observe mode will record an empty book until something opens. "
+              "Harmless, just not yet informative.")
 
 
 # ---------------------------------------------------------------------------
